@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "下载链接。支持多个，请用分号(;)隔开。格式：链接|自定义文件名"
+        description: "下载链接。支持多行粘贴，只要包含 '链接|自定义文件名' 即可，无需管空格和换行。"
         required: true
         type: string
       tags:
@@ -42,7 +42,7 @@ env:
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 延长到 6 小时应对大文件
+    timeout-minutes: 360  # 6 小时超长待机，不怕大文件
     environment: openlist-crypt
 
     steps:
@@ -136,14 +136,25 @@ jobs:
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
-          # ================= 关键修复：不要用空格切分！改用分号 ";" 作为边界 =================
-          echo "$URLS" | tr ';' '\n' | sed '/^$/d' > urls_list.txt
-          
+          # ================= 智能切分 =================
+          # 无论 GitHub 吞没吞换行，直接通过正则寻找 http/https 作为起点切割
+          printf '%s' "$URLS" > raw_input.txt
+          python3 -c "
+          import re
+          with open('raw_input.txt', 'r', encoding='utf-8') as f:
+              content = f.read()
+          # 匹配 http:// 或 https:// 并以此为界切分
+          parts = re.split(r'(?=https?://)', content)
+          with open('urls_list.txt', 'w', encoding='utf-8') as f:
+              for p in parts:
+                  p = p.strip()
+                  if p:
+                      f.write(p + '\n')
+          "
+
           INDEX=1
           
           while IFS= read -r line; do
-            # 去掉开头和结尾的空白字符（防止分号前后有空格）
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [ -z "$line" ] && continue
 
             echo "=================================================="
