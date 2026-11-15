@@ -1,0 +1,361 @@
+# .github/workflows/upload-openlist.yml
+# 手动触发：workflow_dispatch
+# 流程：下载视频/压缩包 → faststart 处理 → 生成 Crypt 缩略图 → 经 OpenList Crypt(WebDAV) 加密上传到 139Yun
+#
+# openlist-secrets 来源说明：
+#   本 workflow 假设 data.db.gpg 等密文放在**独立私有仓库 <user>/openlist-secrets**，
+#   通过第二个 checkout（需 fine-grained PAT，只读该仓库）拉到 path: openlist-secrets。
+#   如果你把密文放在**本仓库同目录** openlist-secrets/，则删除下面第二个 Checkout 步骤即可
+#   （第一个 checkout 已把它带下来），并把 token 相关说明一并删掉。
+#
+# 另需在仓库 Settings → Secrets and variables → Actions → Variables 里新增变量 SECRET_REPO，
+# 值为 <user>/openlist-secrets（with: 不支持 env 上下文，repository 走 vars 才能展开）。
+#
+# 公有主仓库说明：
+#   本 workflow 设计为在**公有主仓库**（Public）运行，Actions 日志对所有人可见。
+#   因此对日志做了脱敏：不打印文件列表、tags 实际值、API 完整响应体；
+#   rclone 用 -q + --stats-one-line 只留一行汇总，远端统计用 rclone size 只报数量/大小。
+#   openlist-secrets 为私有仓库，靠 fine-grained PAT（OPENLIST_SECRETS_TOKEN）只读拉取；
+#   主仓库的 Secrets/Variables 在 Public 仓库下依然安全（仅 Actions 运行时可读，日志自动掩码）。
+#
+# 触发方式提醒：本 workflow 仅用 workflow_dispatch 手动触发。若改为 push/pull_request/schedule
+# 触发，需注意：fork PR 触发的 workflow 拿不到仓库 Secrets（包括 OPENLIST_SECRETS_TOKEN），
+# 公有仓库下任何人都可能构造 PR，因此**绝不要**为此放宽触发条件或放开 Secrets 权限。
+
+name: Upload to OpenList Crypt
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "下载链接（直链）"
+        required: true
+        type: string
+      tags:
+        description: "标签/目标文件夹名，可多个，逗号分隔"
+        required: true
+        type: string
+      is_archive:
+        description: "下载的是压缩包吗？(zip/7z/tar)"
+        required: true
+        default: false
+        type: boolean
+      ext:
+        description: "非压缩包时指定的扩展名（如 mp4 / mkv；留空则从 URL path 推断，兜底 mp4）"
+        required: false
+        default: ""
+        type: string
+
+env:
+  # ========== 占位符，按需修改 ==========
+  OPENLIST_PORT: 5244                  # OpenList WebDAV 端口
+  CRYPT_MOUNT: /加密存储               # Crypt 挂载路径（data.db 里的配置）
+  DOCKER_IMAGE: openlistteam/openlist:latest
+  WORK_DIR: ${{ github.workspace }}/work
+  SECRET_DIR: openlist-secrets         # checkout 后密文所在目录（SECRET_REPO 在仓库 Variables 里配置）
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 0a. 拉取独立私有密文仓库 ----------
+      # OPENLIST_SECRETS_TOKEN：fine-grained PAT，Contents: Read-only，仅授权 <user>/openlist-secrets
+      - name: Checkout secrets repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SECRET_REPO }}
+          token: ${{ secrets.OPENLIST_SECRETS_TOKEN }}
+          path: openlist-secrets
+
+      # ---------- 0b. 还原 OpenList 配置 ----------
+      # config.json 走 Base64 Secret；data.db（含 139Yun token + Crypt 密码）走 GPG 加密文件。
+      # 本地加密命令（PowerShell，在 data 目录下执行，先停止本地 OpenList 保证 data.db 落盘）：
+      #   gpg --batch --yes --symmetric --cipher-algo AES256 \
+      #       --pinentry-mode loopback --passphrase "你的强密码" --output data.db.gpg data.db
+      # 把 data.db.gpg 提交到 openlist-secrets 仓库；密码存 Secret OPENLIST_DB_GPG_PASS。
+      - name: Restore OpenList config
+        env:
+          OPENLIST_CONFIG_JSON_B64: ${{ secrets.OPENLIST_CONFIG_JSON_B64 }}   # config.json 的 base64
+          OPENLIST_DB_GPG_PASS: ${{ secrets.OPENLIST_DB_GPG_PASS }}           # data.db.gpg 的对称密码
+        run: |
+          set -euo pipefail
+          mkdir -p openlist/data
+          # printf 而非 echo：避免 Secret 粘贴时尾部换行导致解码失败
+          printf '%s' "$OPENLIST_CONFIG_JSON_B64" | base64 -d > openlist/data/config.json
+          gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$OPENLIST_DB_GPG_PASS" \
+              --decrypt "${SECRET_DIR}/data.db.gpg" > openlist/data/data.db
+          # 若本地打包时也带了 wal/shm（同样 gpg 加密后放入 openlist-secrets），此处可选还原：
+          if [ -f "${SECRET_DIR}/data.db-wal.gpg" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$OPENLIST_DB_GPG_PASS" \
+                --decrypt "${SECRET_DIR}/data.db-wal.gpg" > openlist/data/data.db-wal
+          fi
+          if [ -f "${SECRET_DIR}/data.db-shm.gpg" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$OPENLIST_DB_GPG_PASS" \
+                --decrypt "${SECRET_DIR}/data.db-shm.gpg" > openlist/data/data.db-shm
+          fi
+          echo "OpenList data restored:"
+          ls -la openlist/data/
+
+      # ---------- 1. 安装工具 ----------
+      - name: Install tools (ffmpeg, 7z, zip, rclone)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg p7zip-full zip jq curl rclone file
+
+      # ---------- 2. 下载 ----------
+      - name: Download file (with retry & UA spoof)
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR/download"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "Download attempt $i ..."
+            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
+                 -A "$UA" -o "$WORK_DIR/download/source.bin" "$URL"; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          [ "$ok" = "1" ] || { echo "::error::下载失败：$URL"; exit 1; }
+
+          # 非压缩包：按输入扩展名重命名（避免无扩展名导致视频过滤失效）
+          if [ "${{ inputs.is_archive }}" != "true" ]; then
+            ext="${{ inputs.ext }}"
+            if [ -z "$ext" ]; then
+              # 只取 URL 的 path 部分（去掉 query），再取扩展名；兜底 mp4
+              url_path="${URL%%\?*}"
+              ext="$(basename "$url_path" | sed -n 's/.*\.\([A-Za-z0-9]\{1,5\}\)$/\1/p')"
+              [ -z "$ext" ] && ext="mp4"
+              ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+            fi
+            mv "$WORK_DIR/download/source.bin" "$WORK_DIR/download/source.$ext"
+          fi
+          ls -la "$WORK_DIR/download/"
+
+      # ---------- 3. 压缩包处理 ----------
+      - name: Extract archive & split videos / non-videos
+        if: inputs.is_archive == true
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          mkdir -p extracted output/videos
+          case "$(file -b download/source.* | head -1)" in
+            *"Zip archive"*|*"zip"*)  7z x -y -oextracted download/source.* >/dev/null ;;
+            *"7-zip archive"*|*"7z"*) 7z x -y -oextracted download/source.* >/dev/null ;;
+            *"tar archive"*|*"POSIX tar"*|*"gzip compressed"*) tar -xf download/source.* -C extracted ;;
+            *) echo "::error::未识别的压缩包格式"; exit 1 ;;
+          esac
+
+          video_ext_regex='\.(mp4|mkv|avi|mov|flv|wmv|ts|m2ts|webm|m4v|mpg|mpeg|rmvb|3gp)$'
+          # 视频保留相对路径结构 -> work/output/videos/
+          # find -print0 + IFS= read -d '' ：对空格/引号/反斜杠等特殊文件名更稳
+          find extracted -type f -print0 | while IFS= read -r -d '' f; do
+            rel="${f#extracted/}"
+            if [[ "$rel" =~ $video_ext_regex ]]; then
+              mkdir -p "output/videos/$(dirname "$rel")"
+              mv "$f" "output/videos/$rel"
+            else
+              mkdir -p "others/$(dirname "$rel")"
+              mv "$f" "others/$rel"
+            fi
+          done
+          # 脱敏：公有仓库日志可见，只报数量不列文件名
+          echo "Videos: $(find output/videos -type f | wc -l) file(s)"
+          echo "Others: $(find others -type f | wc -l) file(s)"
+
+      - name: Repack non-video files into one zip
+        if: inputs.is_archive == true
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          if [ -n "$(find others -type f -print -quit)" ]; then
+            (cd others && zip -r -q ../output/nonvideo.zip .)
+            echo "Repacked non-video files -> output/nonvideo.zip"
+          else
+            echo "No non-video files."
+          fi
+
+      # ---------- 4. faststart 处理 ----------
+      - name: Ensure faststart (moov before mdat) for all videos
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          # 非压缩包：单视频直接移入 output/videos/
+          if [ "${{ inputs.is_archive }}" != "true" ]; then
+            mkdir -p output/videos
+            mv download/source.* output/videos/
+          fi
+
+          fix_one() {
+            f="$1"
+            echo "== $f =="
+            if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" >/dev/null 2>&1; then
+              echo "  not a decodable video, skip"; return 0
+            fi
+            # 比较 moov / mdat box 在 trace 输出中出现的先后，并打印行号便于核对
+            trace=$(ffprobe -v trace -i "$f" 2>&1 || true)
+            moov_first=$(echo "$trace" | grep -n "type:'moov'" | head -1 | cut -d: -f1 || echo 0)
+            mdat_first=$(echo "$trace" | grep -n "type:'mdat'" | head -1 | cut -d: -f1 || echo 0)
+            echo "  moov line=$moov_first, mdat line=$mdat_first"
+            if [ "$moov_first" != "0" ] && [ "$mdat_first" != "0" ] && [ "$moov_first" -lt "$mdat_first" ]; then
+              echo "  already faststart, skip"
+              return 0
+            fi
+            tmp="$f.tmp.mp4"
+            case "${f##*.}" in
+              mp4|m4v|mov)
+                # 无损 remux：不重编码，仅重排 box 让 moov 前置
+                ffmpeg -y -v error -i "$f" -c copy -movflags +faststart "$tmp" && mv "$tmp" "$f"
+                echo "  remuxed with +faststart" ;;
+              *) echo "  non-mp4 container, faststart 不适用，skip" ;;
+            esac
+          }
+          # while -d '' 循环：对含引号/$ 等特殊字符的文件名安全
+          find output/videos -type f -print0 | while IFS= read -r -d '' f; do fix_one "$f"; done
+
+      # ---------- 5. 生成缩略图 ----------
+      # 结构：work/output/thumbs/<视频相对目录>/.thumbnails/<视频文件名>.webp
+      # 即 thumbs/ 树与 output/videos/ 树逐层对应，仅多了 .thumbnails/ 一层。
+      # 上传时 rclone copy 整棵 thumbs/ 到 Crypt 挂载点根：
+      #   rclone copy work/output/thumbs "ol:${CRYPT_MOUNT}/${TAGS}/"
+      # Crypt 驱动 thumbnail: true 会在挂载点下查找 .thumbnails/，用明文文件名关联，
+      # OpenList 落盘到底层 139Yun 时自行加密目录/文件名。
+      # 注意：第一次跑完后请人工在 OpenList 网页端打开视频确认缩略图正常显示！
+      - name: Generate thumbnails
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          find output/videos -type f -print0 | while IFS= read -r -d '' f; do
+            rel="${f#output/videos/}"
+            dir="$(dirname "$rel")"
+            base="$(basename "$rel")"
+            thumb_dir="output/thumbs/$dir/.thumbnails"
+            mkdir -p "$thumb_dir"
+            dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")
+            at=$(awk -v d="$dur" 'BEGIN{print (d>10)?int(d*0.1):1}')
+            ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" \
+              "$thumb_dir/${base%.*}.webp"
+          done
+          # 脱敏：只报数量；结构上与 videos/ 逐层对应（含 .thumbnails/ 一层）
+          echo "Thumbnails: $(find output/thumbs -type f | wc -l) file(s)"
+
+      # ---------- 6. tags 清洗 ----------
+      - name: Sanitize tags
+        id: tags
+        run: |
+          set -euo pipefail
+          raw="${{ inputs.tags }}"
+          # 逗号/空格转下划线，去掉 Windows/路径非法字符
+          clean=$(echo "$raw" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
+          [ -z "$clean" ] && clean="upload"
+          echo "tags=$clean" >> "$GITHUB_OUTPUT"
+          # 脱敏：不打印实际 tags 值（公有仓库日志可见），只确认已清洗
+          echo "Tags sanitized (length: ${#clean})"
+
+      # ---------- 7. 启动 OpenList 并等待就绪 ----------
+      - name: Start OpenList container
+        run: |
+          set -euo pipefail
+          docker run -d --name openlist \
+            -p ${OPENLIST_PORT}:5244 \
+            -v "${{ github.workspace }}/openlist/data:/opt/openlist/data" \
+            ${DOCKER_IMAGE}
+          # 轮询 API 就绪（最多 120s，不写死 sleep）
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:${OPENLIST_PORT}/ping" >/dev/null 2>&1 \
+               || curl -sf "http://localhost:${OPENLIST_PORT}/api/public/settings" >/dev/null 2>&1; then
+              echo "OpenList API ready."
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::OpenList 启动失败"
+              docker logs openlist || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+      # ---------- 8. 139Yun / Crypt 挂载连通性检查 ----------
+      # 用 admin 密码 Basic Auth 调 /api/fs/list 探测 Crypt 挂载点。
+      # 注意：body 必须用双引号让 ${CRYPT_MOUNT} 展开（单引号会导致变量不展开）。
+      # 139Yun OAuth token 过期时会在此暴露：OpenList 返回非 200 或 message 含 unauthorized。
+      - name: Check Crypt mount connectivity
+        env:
+          OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -s -u "admin:$OPENLIST_ADMIN_PASS" \
+            "http://localhost:${OPENLIST_PORT}/api/fs/list" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}")
+          code=$(echo "$resp" | jq -r '.code')
+          if [ "$code" != "200" ]; then
+            echo "::error::OpenList API 返回 code=$code: $resp"
+            echo "::error::若 message 提示 failed get storage / unauthorized / token invalid，"
+            echo "::error::很可能是 139Yun 的 OAuth token 已过期。请在本地 OpenList 网页端重新授权 139Yun，"
+            echo "::error::然后重新执行打包流程：gpg 加密新的 data.db 覆盖 openlist-secrets/data.db.gpg 并提交。"
+            docker logs openlist || true
+            exit 1
+          fi
+          # 脱敏：不输出完整响应体（可能含路径），只确认 200
+          echo "Crypt mount OK"
+
+      # ---------- 9. rclone 经 WebDAV 上传 ----------
+      - name: Upload via rclone WebDAV
+        env:
+          OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [ol]
+          type = webdav
+          url = http://localhost:${OPENLIST_PORT}/dav
+          vendor = other
+          user = admin
+          pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
+          EOF
+
+          DEST="${CRYPT_MOUNT}/${TAGS}"
+          # 脱敏：-q（quiet）不逐文件打日志，--stats-one-line 只留一行汇总（传输数/大小）
+          # 视频：保留相对路径
+          rclone copy "$WORK_DIR/output/videos" "ol:$DEST" --transfers 4 --checkers 8 -q --stats-one-line
+          # 缩略图：thumbs/ 树与 videos/ 逐层对应，直接 copy 到同一 DEST（含 .thumbnails/）
+          if [ -d "$WORK_DIR/output/thumbs" ]; then
+            rclone copy "$WORK_DIR/output/thumbs" "ol:$DEST" --transfers 4 -q --stats-one-line
+          fi
+          # 非视频重打包 zip
+          if [ -f "$WORK_DIR/output/nonvideo.zip" ]; then
+            rclone copy "$WORK_DIR/output/nonvideo.zip" "ol:$DEST" -q --stats-one-line
+          fi
+
+          # 脱敏：不列完整文件列表，只报远端总大小和文件数
+          echo "Upload done. Remote size:"
+          rclone size "ol:$DEST"
+
+      # ---------- 10. 失败时输出日志 ----------
+      # 失败日志保留完整输出便于排查（139Yun token 过期等）。OpenList 日志不会打印 admin 密码
+      # 或 139Yun token 明文（WebDAV 只记用户名，存储 token 只记 "token expired/invalid" 类提示）；
+      # GitHub 对标记为 Secret 的值（OPENLIST_ADMIN_PASSWORD 等）也会在日志中自动掩码为 ***。
+      - name: Dump OpenList logs on failure
+        if: failure()
+        run: docker logs --tail 200 openlist || true
+
+      # ---------- 11. 清理 ----------
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f openlist || true
