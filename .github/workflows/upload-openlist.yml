@@ -1,60 +1,66 @@
-# .github/workflows/upload-openlist.yml
-# 手动触发：workflow_dispatch
-# 流程：下载视频/压缩包 → faststart 处理 → 生成 Crypt 缩略图 → 经 OpenList Crypt(WebDAV) 加密上传到 139Yun
-
 name: Upload to OpenList Crypt
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "下载链接。支持格式：原生链接 或 原生链接|自定义文件名"
+        description: "下载链接。支持单行或多个（用空格隔开），支持 '链接|自定义文件名' 格式"
         required: true
         type: string
       tags:
-        description: "标签/目标文件夹名，可多个，逗号分隔"
+        description: "目标文件夹名"
         required: true
         type: string
       is_archive:
-        description: "下载的是压缩包吗？(zip/7z/tar)"
+        description: "下载的是压缩包吗？"
         required: true
         default: false
         type: boolean
       ext:
-        description: "非压缩包时指定的扩展名（如 mp4 / mkv；留空则从 URL path 推断，兜底 mp4）"
+        description: "非压缩包时的扩展名（留空自动推断）"
         required: false
         default: ""
         type: string
       referer:
-        description: "下载时附加的 Referer（留空则不发送，用于防盗链站点，如 https://pawchive.pw/）"
+        description: "Referer (防防盗链)"
         required: false
         default: "https://pawchive.pw/"
         type: string
       user_agent:
-        description: "下载时使用的 User-Agent（留空则用默认 Chrome UA）"
+        description: "User-Agent（留空默认 Chrome）"
         required: false
         default: ""
         type: string
 
 env:
-  # ========== 占位符，按需修改 ==========
-  OPENLIST_PORT: 5244                  # OpenList WebDAV 端口
-  CRYPT_MOUNT: /加密存储               # Crypt 挂载路径（data.db 里的配置）
+  OPENLIST_PORT: 5244
+  CRYPT_MOUNT: /加密存储
   DOCKER_IMAGE: openlistteam/openlist:latest
   WORK_DIR: ${{ github.workspace }}/work
-  SECRET_DIR: openlist-secrets         # checkout 后密文所在目录
+  SECRET_DIR: openlist-secrets
 
 jobs:
   upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    environment: openlist-crypt          # <--- 引用环境机密
+    timeout-minutes: 360  # 延长到 6 小时应对大文件
+    environment: openlist-crypt
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- 0a. 拉取独立私有密文仓库 ----------
+      # ==================== 0. 榨干 Runner 磁盘空间 ====================
+      - name: Free up disk space
+        run: |
+          echo "=== 清理前 ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+          echo "=== 清理后 ==="
+          df -h
+
+      # ==================== 1. 拉取私有配置 ====================
       - name: Checkout secrets repo
         uses: actions/checkout@v4
         with:
@@ -62,7 +68,6 @@ jobs:
           token: ${{ secrets.OPENLIST_SECRETS_TOKEN }}
           path: openlist-secrets
 
-      # ---------- 0b. 还原 OpenList 配置 ----------
       - name: Restore OpenList config
         env:
           OPENLIST_CONFIG_JSON_B64: ${{ secrets.OPENLIST_CONFIG_JSON_B64 }}
@@ -71,288 +76,51 @@ jobs:
           set -euo pipefail
           mkdir -p openlist/data
           printf '%s' "$OPENLIST_CONFIG_JSON_B64" | base64 -d > openlist/data/config.json
-          gpg --batch --yes --pinentry-mode loopback \
-              --passphrase "$OPENLIST_DB_GPG_PASS" \
-              --decrypt "${SECRET_DIR}/data.db.gpg" > openlist/data/data.db
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENLIST_DB_GPG_PASS" --decrypt "${SECRET_DIR}/data.db.gpg" > openlist/data/data.db
           if [ -f "${SECRET_DIR}/data.db-wal.gpg" ]; then
-            gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$OPENLIST_DB_GPG_PASS" \
-                --decrypt "${SECRET_DIR}/data.db-wal.gpg" > openlist/data/data.db-wal
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENLIST_DB_GPG_PASS" --decrypt "${SECRET_DIR}/data.db-wal.gpg" > openlist/data/data.db-wal
           fi
-          if [ -f "${SECRET_DIR}/data.db-shm.gpg" ]; then
-            gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$OPENLIST_DB_GPG_PASS" \
-                --decrypt "${SECRET_DIR}/data.db-shm.gpg" > openlist/data/data.db-shm
-          fi
-          echo "OpenList data restored:"
-          ls -la openlist/data/
 
-      # ---------- 1. 安装工具 ----------
-      - name: Install tools (ffmpeg, 7z, zip, rclone)
+      # ==================== 2. 安装工具 ====================
+      - name: Install tools
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg p7zip-full zip jq curl rclone file
 
-      # ---------- 2. 下载（智能解析链接与重命名） ----------
-      - name: Download file (with retry, UA & referer)
-        env:
-          URL: ${{ inputs.url }}
-          EXT: ${{ inputs.ext }}
-          IS_ARCHIVE: ${{ inputs.is_archive }}
-          REFERER: ${{ inputs.referer }}
-          USER_AGENT: ${{ inputs.user_agent }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$WORK_DIR/download"
-
-          # 1. 解析输入，提取干净链接和自定义名
-          RAW_URL="$URL"
-          CUSTOM_NAME=""
-          if [[ "$URL" == *"|"* ]]; then
-            RAW_URL="${URL%%|*}"
-            CUSTOM_NAME="${URL#*|}"
-          fi
-          
-          # 2. 强制剥离可能存在的 ?f= 参数，防止 403
-          if [[ "$RAW_URL" == *"?f="* ]]; then
-            BASE_URL="${RAW_URL%%\?*}"
-            QUERY="${RAW_URL#*\?}"
-            E_PARAM=$(echo "$QUERY" | grep -o 'e=[^&]*' || true)
-            S_PARAM=$(echo "$QUERY" | grep -o 's=[^&]*' || true)
-            CLEAN_QS=""
-            if [ -n "$E_PARAM" ]; then CLEAN_QS="$E_PARAM"; fi
-            if [ -n "$S_PARAM" ]; then 
-              if [ -n "$CLEAN_QS" ]; then CLEAN_QS="$CLEAN_QS&$S_PARAM"; else CLEAN_QS="$S_PARAM"; fi
-            fi
-            if [ -n "$CLEAN_QS" ]; then
-              RAW_URL="$BASE_URL?$CLEAN_QS"
-            else
-              RAW_URL="$BASE_URL"
-            fi
-          fi
-
-          echo "Actual Download URL: $RAW_URL"
-          if [ -n "$CUSTOM_NAME" ]; then echo "Target Filename: $CUSTOM_NAME"; fi
-
-          # 3. 下载
-          UA="$USER_AGENT"
-          if [ -z "$UA" ]; then
-            UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          fi
-          
-          CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
-          if [ -n "$REFERER" ]; then CURL_ARGS+=(-e "$REFERER"); fi
-
-          ok=0
-          for i in 1 2 3 4 5; do
-            echo "Download attempt $i ..."
-            if curl "${CURL_ARGS[@]}" -o "$WORK_DIR/download/source.bin" "$RAW_URL"; then
-              ok=1
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "$ok" != "1" ]; then
-            echo "::group::Diagnose download failure"
-            echo "--- Response headers ---"
-            DIAG_ARGS=(-sS -I -A "$UA")
-            if [ -n "$REFERER" ]; then DIAG_ARGS+=(-e "$REFERER"); fi
-            curl "${DIAG_ARGS[@]}" "$RAW_URL" || true
-            echo "::endgroup::"
-            echo "::error::下载失败：$RAW_URL"
-            exit 1
-          fi
-
-          # 4. 重命名
-          if [ "$IS_ARCHIVE" != "true" ]; then
-            ext="$EXT"
-            if [ -n "$CUSTOM_NAME" ]; then
-              final_name=$(echo "$CUSTOM_NAME" | sed 's#[/\\:*?"<>|]#_#g')
-              if [[ "$final_name" != *.* ]]; then
-                 if [ -z "$ext" ]; then
-                    url_path="${RAW_URL%%\?*}"
-                    ext="$(basename "$url_path" | sed -n 's/.*\.\([A-Za-z0-9]\{1,5\}\)$/\1/p')"
-                    [ -z "$ext" ] && ext="mp4"
-                 fi
-                 final_name="$final_name.$ext"
-              fi
-            else
-              if [ -z "$ext" ]; then
-                url_path="${RAW_URL%%\?*}"
-                ext="$(basename "$url_path" | sed -n 's/.*\.\([A-Za-z0-9]\{1,5\}\)$/\1/p')"
-                [ -z "$ext" ] && ext="mp4"
-                ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
-              fi
-              final_name="source.$ext"
-            fi
-            mv "$WORK_DIR/download/source.bin" "$WORK_DIR/download/$final_name"
-            echo "Renamed to: $final_name"
-          fi
-          ls -la "$WORK_DIR/download/"
-
-      # ---------- 3. 压缩包处理 ----------
-      - name: Extract archive & split videos / non-videos
-        if: inputs.is_archive == true
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          mkdir -p extracted output/videos
-          case "$(file -b download/source.* | head -1)" in
-            *"Zip archive"*|*"zip"*)  7z x -y -oextracted download/source.* >/dev/null ;;
-            *"7-zip archive"*|*"7z"*) 7z x -y -oextracted download/source.* >/dev/null ;;
-            *"tar archive"*|*"POSIX tar"*|*"gzip compressed"*) tar -xf download/source.* -C extracted ;;
-            *) echo "::error::未识别的压缩包格式"; exit 1 ;;
-          esac
-
-          video_ext_regex='\.(mp4|mkv|avi|mov|flv|wmv|ts|m2ts|webm|m4v|mpg|mpeg|rmvb|3gp)$'
-          find extracted -type f -print0 | while IFS= read -r -d '' f; do
-            rel="${f#extracted/}"
-            if [[ "$rel" =~ $video_ext_regex ]]; then
-              mkdir -p "output/videos/$(dirname "$rel")"
-              mv "$f" "output/videos/$rel"
-            else
-              mkdir -p "others/$(dirname "$rel")"
-              mv "$f" "others/$rel"
-            fi
-          done
-          echo "Videos: $(find output/videos -type f | wc -l) file(s)"
-          echo "Others: $(find others -type f | wc -l) file(s)"
-
-      - name: Repack non-video files into one zip
-        if: inputs.is_archive == true
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          if [ -n "$(find others -type f -print -quit)" ]; then
-            (cd others && zip -r -q ../output/nonvideo.zip .)
-            echo "Repacked non-video files -> output/nonvideo.zip"
-          else
-            echo "No non-video files."
-          fi
-
-      # ---------- 4. faststart 处理 ----------
-      - name: Ensure faststart (moov before mdat) for all videos
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          if [ "${{ inputs.is_archive }}" != "true" ]; then
-            mkdir -p output/videos
-            mv download/* output/videos/
-          fi
-
-          fix_one() {
-            f="$1"
-            echo "== $f =="
-            if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" >/dev/null 2>&1; then
-              echo "  not a decodable video, skip"; return 0
-            fi
-            trace=$(ffprobe -v trace -i "$f" 2>&1 || true)
-            moov_first=$(echo "$trace" | grep -n "type:'moov'" | head -1 | cut -d: -f1 || echo 0)
-            mdat_first=$(echo "$trace" | grep -n "type:'mdat'" | head -1 | cut -d: -f1 || echo 0)
-            echo "  moov line=$moov_first, mdat line=$mdat_first"
-            if [ "$moov_first" != "0" ] && [ "$mdat_first" != "0" ] && [ "$moov_first" -lt "$mdat_first" ]; then
-              echo "  already faststart, skip"
-              return 0
-            fi
-            tmp="$f.tmp.mp4"
-            case "${f##*.}" in
-              mp4|m4v|mov)
-                ffmpeg -y -v error -i "$f" -c copy -movflags +faststart "$tmp" && mv "$tmp" "$f"
-                echo "  remuxed with +faststart" ;;
-              *) echo "  non-mp4 container, faststart 不适用，skip" ;;
-            esac
-          }
-          find output/videos -type f -print0 | while IFS= read -r -d '' f; do fix_one "$f"; done
-
-      # ---------- 5. 生成缩略图 ----------
-      - name: Generate thumbnails
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          find output/videos -type f -print0 | while IFS= read -r -d '' f; do
-            rel="${f#output/videos/}"
-            dir="$(dirname "$rel")"
-            base="$(basename "$rel")"
-            thumb_dir="output/thumbs/$dir/.thumbnails"
-            mkdir -p "$thumb_dir"
-            dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f")
-            at=$(awk -v d="$dur" 'BEGIN{print (d>10)?int(d*0.1):1}')
-            ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" \
-              "$thumb_dir/${base%.*}.webp"
-          done
-          echo "Thumbnails: $(find output/thumbs -type f | wc -l) file(s)"
-
-      # ---------- 6. tags 清洗 ----------
-      - name: Sanitize tags
-        id: tags
-        run: |
-          set -euo pipefail
-          raw="${{ inputs.tags }}"
-          clean=$(echo "$raw" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
-          [ -z "$clean" ] && clean="upload"
-          echo "tags=$clean" >> "$GITHUB_OUTPUT"
-          echo "Tags sanitized (length: ${#clean})"
-
-      # ---------- 7. 启动 OpenList 并等待就绪 ----------
+      # ==================== 3. 启动 OpenList 容器 ====================
       - name: Start OpenList container
         run: |
-          set -euo pipefail
-          docker run -d --name openlist \
-            -p ${OPENLIST_PORT}:5244 \
-            -v "${{ github.workspace }}/openlist/data:/opt/openlist/data" \
-            ${DOCKER_IMAGE}
+          docker run -d --name openlist -p ${OPENLIST_PORT}:5244 -v "${{ github.workspace }}/openlist/data:/opt/openlist/data" ${DOCKER_IMAGE}
           for i in $(seq 1 60); do
-            if curl -sf "http://localhost:${OPENLIST_PORT}/ping" >/dev/null 2>&1 \
-               || curl -sf "http://localhost:${OPENLIST_PORT}/api/public/settings" >/dev/null 2>&1; then
-              echo "OpenList API ready."
-              break
-            fi
-            if [ "$i" = "60" ]; then
-              echo "::error::OpenList 启动失败"
-              docker logs openlist || true
-              exit 1
-            fi
+            if curl -sf "http://localhost:${OPENLIST_PORT}/ping" >/dev/null 2>&1; then break; fi
             sleep 2
           done
 
-      # ---------- 8. 139Yun / Crypt 挂载连通性检查 ----------
       - name: Check Crypt mount connectivity
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
         run: |
-          set -euo pipefail
-          login_resp=$(curl -s -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"admin\",\"password\":\"${OPENLIST_ADMIN_PASS}\"}")
+          login_resp=$(curl -s -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"${OPENLIST_ADMIN_PASS}\"}")
           token=$(echo "$login_resp" | jq -r '.data.token // empty')
-          if [ -z "$token" ]; then
-            echo "::error::登录失败，响应: $login_resp"
-            docker logs openlist || true
-            exit 1
-          fi
-          echo "Login OK"
-
-          resp=$(curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $token" \
-            -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}")
-          code=$(echo "$resp" | jq -r '.code')
-          if [ "$code" != "200" ]; then
-            echo "::error::OpenList API 返回 code=$code: $resp"
-            docker logs openlist || true
-            exit 1
-          fi
+          [ -z "$token" ] && { echo "::error::Login failed"; exit 1; }
+          curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" -H "Content-Type: application/json" -H "Authorization: $token" -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}" | jq -e '.code == 200' > /dev/null || { echo "::error::Crypt mount failed"; exit 1; }
           echo "Crypt mount OK"
 
-      # ---------- 9. rclone 经 WebDAV 上传 ----------
-      - name: Upload via rclone WebDAV
+      # ==================== 4. 核心：流式逐个处理大文件 ====================
+      - name: Process and Upload sequentially
         env:
+          URLS: ${{ inputs.url }}
+          EXT: ${{ inputs.ext }}
+          IS_ARCHIVE: ${{ inputs.is_archive }}
+          REFERER: ${{ inputs.referer }}
+          USER_AGENT: ${{ inputs.user_agent }}
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
-          TAGS: ${{ steps.tags.outputs.tags }}
+          TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
+          
+          # 1. 初始化 rclone 配置
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
           [ol]
@@ -363,24 +131,136 @@ jobs:
           pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
           EOF
 
-          DEST="${CRYPT_MOUNT}/${TAGS}"
-          rclone copy "$WORK_DIR/output/videos" "ol:$DEST" --transfers 4 --checkers 8 -q --stats-one-line
-          if [ -d "$WORK_DIR/output/thumbs" ]; then
-            rclone copy "$WORK_DIR/output/thumbs" "ol:$DEST" --transfers 4 -q --stats-one-line
-          fi
-          if [ -f "$WORK_DIR/output/nonvideo.zip" ]; then
-            rclone copy "$WORK_DIR/output/nonvideo.zip" "ol:$DEST" -q --stats-one-line
-          fi
+          # 2. 解析清洗 tags
+          CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
+          [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
+          DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
-          echo "Upload done. Remote size:"
+          # 3. 将多行/多链接按空格切分并循环
+          echo "$URLS" | tr ' ' '\n' | sed '/^$/d' > urls_list.txt
+          INDEX=1
+          
+          while IFS= read -r line; do
+            echo "=================================================="
+            echo "[$INDEX] 正在处理: $line"
+            
+            # 解析链接和文件名
+            RAW_URL="$line"
+            CUSTOM_NAME=""
+            if [[ "$line" == *"|"* ]]; then
+              RAW_URL="${line%%|*}"
+              CUSTOM_NAME="${line#*|}"
+            fi
+            
+            # 强制剥离 ?f=
+            if [[ "$RAW_URL" == *"?f="* ]]; then
+              BASE_URL="${RAW_URL%%\?*}"
+              QUERY="${RAW_URL#*\?}"
+              E_PARAM=$(echo "$QUERY" | grep -o 'e=[^&]*' || true)
+              S_PARAM=$(echo "$QUERY" | grep -o 's=[^&]*' || true)
+              CLEAN_QS=""
+              if [ -n "$E_PARAM" ]; then CLEAN_QS="$E_PARAM"; fi
+              if [ -n "$S_PARAM" ]; then CLEAN_QS="${CLEAN_QS:+$CLEAN_QS&}$S_PARAM"; fi
+              if [ -n "$CLEAN_QS" ]; then RAW_URL="$BASE_URL?$CLEAN_QS"; else RAW_URL="$BASE_URL"; fi
+            fi
+
+            # 准备临时目录
+            mkdir -p "work/download" "work/output/videos" "work/output/thumbs"
+            
+            # 下载
+            UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
+            CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
+            if [ -n "$REFERER" ]; then CURL_ARGS+=(-e "$REFERER"); fi
+            
+            echo "-> 下载中..."
+            curl "${CURL_ARGS[@]}" -o "work/download/source.bin" "$RAW_URL" || { echo "::error::下载失败 $RAW_URL"; continue; }
+            
+            # 重命名
+            FINAL_NAME="source.mp4"
+            if [ "$IS_ARCHIVE" != "true" ]; then
+              ext="$EXT"
+              if [ -n "$CUSTOM_NAME" ]; then
+                FINAL_NAME=$(echo "$CUSTOM_NAME" | sed 's#[/\\:*?"<>|]#_#g')
+                if [[ "$FINAL_NAME" != *.* ]]; then
+                   if [ -z "$ext" ]; then
+                      url_path="${RAW_URL%%\?*}"
+                      ext="$(basename "$url_path" | sed -n 's/.*\.\([A-Za-z0-9]\{1,5\}\)$/\1/p')"
+                      [ -z "$ext" ] && ext="mp4"
+                   fi
+                   FINAL_NAME="$FINAL_NAME.$ext"
+                fi
+              else
+                if [ -z "$ext" ]; then
+                  url_path="${RAW_URL%%\?*}"
+                  ext="$(basename "$url_path" | sed -n 's/.*\.\([A-Za-z0-9]\{1,5\}\)$/\1/p')"
+                  [ -z "$ext" ] && ext="mp4"
+                fi
+                FINAL_NAME="source.$ext"
+              fi
+            fi
+            mv "work/download/source.bin" "work/download/$FINAL_NAME"
+
+            # 处理压缩包
+            if [ "$IS_ARCHIVE" == "true" ]; then
+               echo "-> 解压中..."
+               7z x -y -owork/extracted "work/download/$FINAL_NAME" >/dev/null
+               find work/extracted -type f | while read -r f; do
+                 if [[ "$f" =~ \.(mp4|mkv|avi|mov|flv|wmv|ts|m2ts|webm|m4v|mpg|mpeg|rmvb|3gp)$ ]]; then
+                   mkdir -p "work/output/videos/$(dirname "${f#work/extracted/}")"
+                   mv "$f" "work/output/videos/${f#work/extracted/}"
+                 fi
+               done
+               rm -rf work/extracted "work/download/$FINAL_NAME"
+            else
+               mv "work/download/$FINAL_NAME" "work/output/videos/"
+            fi
+
+            # faststart 处理
+            echo "-> 修复 Faststart..."
+            find work/output/videos -type f | while read -r f; do
+              if ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" >/dev/null 2>&1; then
+                trace=$(ffprobe -v trace -i "$f" 2>&1 || true)
+                moov_line=$(echo "$trace" | grep -n "type:'moov'" | head -1 | cut -d: -f1 || echo 0)
+                mdat_line=$(echo "$trace" | grep -n "type:'mdat'" | head -1 | cut -d: -f1 || echo 0)
+                if [ "$moov_line" != "0" ] && [ "$mdat_line" != "0" ] && [ "$moov_line" -gt "$mdat_line" ]; then
+                  ffmpeg -y -v error -i "$f" -c copy -movflags +faststart "$f.tmp.mp4" && mv "$f.tmp.mp4" "$f"
+                fi
+              fi
+            done
+
+            # 生成缩略图
+            echo "-> 生成缩略图..."
+            find work/output/videos -type f | while read -r f; do
+              rel="${f#work/output/videos/}"
+              thumb_dir="work/output/thumbs/$(dirname "$rel")/.thumbnails"
+              mkdir -p "$thumb_dir"
+              dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo 10)
+              at=$(awk -v d="$dur" 'BEGIN{print (d>10)?int(d*0.1):1}')
+              ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" "$thumb_dir/$(basename "${rel%.*}").webp" 2>/dev/null || true
+            done
+
+            # 上传
+            echo "-> 上传至移动云盘..."
+            rclone copy "work/output/videos" "ol:$DEST" --transfers 4 --multi-thread-streams 4 -q
+            if [ -d "work/output/thumbs" ]; then
+              rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q
+            fi
+
+            # 清理落盘
+            echo "-> 清理本地临时文件..."
+            rm -rf work/download/* work/output/videos/* work/output/thumbs/*
+            
+            INDEX=$((INDEX + 1))
+          done < urls_list.txt
+
+          echo "全部完成. 远端大小:"
           rclone size "ol:$DEST"
 
-      # ---------- 10. 失败时输出日志 ----------
+      # ==================== 5. 清理容器 ====================
       - name: Dump OpenList logs on failure
         if: failure()
         run: docker logs --tail 200 openlist || true
 
-      # ---------- 11. 清理 ----------
       - name: Cleanup container
         if: always()
         run: docker rm -f openlist || true
