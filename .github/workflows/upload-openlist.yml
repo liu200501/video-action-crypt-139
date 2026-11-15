@@ -45,6 +45,16 @@ on:
         required: false
         default: ""
         type: string
+      referer:
+        description: "下载时附加的 Referer（留空则不发送，用于防盗链站点，如 https://pawchive.pw/）"
+        required: false
+        default: ""
+        type: string
+      user_agent:
+        description: "下载时使用的 User-Agent（留空则用默认 Chrome UA）"
+        required: false
+        default: ""
+        type: string
 
 env:
   # ========== 占位符，按需修改 ==========
@@ -111,29 +121,60 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg p7zip-full zip jq curl rclone file
 
-      # ---------- 2. 下载 ----------
-      - name: Download file (with retry & UA spoof)
+      # ---------- 2. 下载（支持自定义 Referer / UA，失败时打印响应头诊断） ----------
+      - name: Download file (with retry, UA & referer)
         env:
           URL: ${{ inputs.url }}
+          EXT: ${{ inputs.ext }}
+          IS_ARCHIVE: ${{ inputs.is_archive }}
+          REFERER: ${{ inputs.referer }}
+          USER_AGENT: ${{ inputs.user_agent }}
         run: |
           set -euo pipefail
           mkdir -p "$WORK_DIR/download"
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+          # UA：用户输入优先，否则默认 Chrome UA
+          UA="$USER_AGENT"
+          if [ -z "$UA" ]; then
+            UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          fi
+          echo "Using UA: $UA"
+          if [ -n "$REFERER" ]; then
+            echo "Using Referer: $REFERER"
+          else
+            echo "No Referer"
+          fi
+
+          # 拼 curl 参数
+          CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
+          if [ -n "$REFERER" ]; then
+            CURL_ARGS+=(-e "$REFERER")
+          fi
+
           ok=0
           for i in 1 2 3 4 5; do
             echo "Download attempt $i ..."
-            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
-                 -A "$UA" -o "$WORK_DIR/download/source.bin" "$URL"; then
+            if curl "${CURL_ARGS[@]}" -o "$WORK_DIR/download/source.bin" "$URL"; then
               ok=1
               break
             fi
             sleep 10
           done
-          [ "$ok" = "1" ] || { echo "::error::下载失败：$URL"; exit 1; }
+
+          if [ "$ok" != "1" ]; then
+            echo "::group::Diagnose download failure"
+            echo "--- Response headers ---"
+            DIAG_ARGS=(-sS -I -A "$UA")
+            if [ -n "$REFERER" ]; then DIAG_ARGS+=(-e "$REFERER"); fi
+            curl "${DIAG_ARGS[@]}" "$URL" || true
+            echo "::endgroup::"
+            echo "::error::下载失败：$URL"
+            exit 1
+          fi
 
           # 非压缩包：按输入扩展名重命名（避免无扩展名导致视频过滤失效）
-          if [ "${{ inputs.is_archive }}" != "true" ]; then
-            ext="${{ inputs.ext }}"
+          if [ "$IS_ARCHIVE" != "true" ]; then
+            ext="$EXT"
             if [ -z "$ext" ]; then
               # 只取 URL 的 path 部分（去掉 query），再取扩展名；兜底 mp4
               url_path="${URL%%\?*}"
