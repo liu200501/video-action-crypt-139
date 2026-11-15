@@ -41,6 +41,8 @@ env:
 
 jobs:
   upload:
+    # ← 关键：Job 名称动态显示为 tag，Actions 左侧栏即可辨识
+    name: "Upload: ${{ inputs.tags }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6 小时超长待机，不怕大文件
     environment: openlist-crypt
@@ -119,7 +121,26 @@ jobs:
           TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
-          
+
+          # ================= 动态摘要：把 tag 信息写入 Actions 页面顶部 =================
+          CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
+          [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
+          DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
+
+          {
+            echo "## 📦 Upload: ${CLEAN_TAGS}"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 目标目录 | \`$DEST\` |"
+            echo "| 压缩包 | \`$IS_ARCHIVE\` |"
+            echo "| 扩展名 | \`${EXT:-自动推断}\` |"
+            echo "| Referer | \`${REFERER:-无}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::group::📦 任务目标: ${CLEAN_TAGS}  →  ${DEST}"
+          echo "::endgroup::"
+
           # 1. 初始化 rclone 配置
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
@@ -130,11 +151,6 @@ jobs:
           user = admin
           pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
           EOF
-
-          # 2. 解析清洗 tags
-          CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
-          [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
-          DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
           # ================= 智能切分 =================
           printf '%s' "$URLS" > raw_input.txt
@@ -151,13 +167,13 @@ jobs:
           "
 
           INDEX=1
-          
+
           while IFS= read -r line; do
             [ -z "$line" ] && continue
 
             echo "=================================================="
             echo "[$INDEX] 正在处理: $line"
-            
+
             # 解析链接和文件名
             RAW_URL="$line"
             CUSTOM_NAME=""
@@ -165,7 +181,7 @@ jobs:
               RAW_URL="${line%%|*}"
               CUSTOM_NAME="${line#*|}"
             fi
-            
+
             # 强制剥离 ?f= （保留 e 和 s 签名）
             if [[ "$RAW_URL" == *"?f="* ]]; then
               BASE_URL="${RAW_URL%%\?*}"
@@ -180,15 +196,15 @@ jobs:
 
             # 准备临时目录
             mkdir -p "work/download" "work/output/videos" "work/output/thumbs"
-            
+
             # 下载
             UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
             CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
             if [ -n "$REFERER" ]; then CURL_ARGS+=(-e "$REFERER"); fi
-            
+
             echo "-> 下载中..."
             curl "${CURL_ARGS[@]}" -o "work/download/source.bin" "$RAW_URL" || { echo "::error::下载失败 $RAW_URL"; continue; }
-            
+
             # 重命名
             FINAL_NAME="source.mp4"
             if [ "$IS_ARCHIVE" != "true" ]; then
@@ -267,7 +283,7 @@ jobs:
               --timeout 30m \
               --retries 3 \
               -P
-              
+
             if [ -d "work/output/thumbs" ]; then
               rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q
             fi
@@ -275,7 +291,7 @@ jobs:
             # 清理落盘
             echo "-> 清理本地临时文件..."
             rm -rf work/download/* work/output/videos/* work/output/thumbs/*
-            
+
             INDEX=$((INDEX + 1))
           done < urls_list.txt
 
