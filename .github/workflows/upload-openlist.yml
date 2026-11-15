@@ -329,18 +329,32 @@ jobs:
             sleep 2
           done
 
-      # ---------- 8. 139Yun / Crypt 挂载连通性检查 ----------
-      # 用 admin 密码 Basic Auth 调 /api/fs/list 探测 Crypt 挂载点。
-      # 注意：body 必须用双引号让 ${CRYPT_MOUNT} 展开（单引号会导致变量不展开）。
-      # 139Yun OAuth token 过期时会在此暴露：OpenList 返回非 200 或 message 含 unauthorized。
+      # ---------- 8. 139Yun / Crypt 挂载连通性检查（JWT 登录） ----------
+      # OpenList 的 /api/fs/list 不支持 Basic Auth（本地验证返回 401 token is invalidated），
+      # 必须先 POST /api/auth/login 拿 JWT，再带 Authorization 头调 API。
+      # 139Yun OAuth token 过期时会在此暴露：code != 200 且 message 含 failed get storage / token invalid。
       - name: Check Crypt mount connectivity
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          resp=$(curl -s -u "admin:$OPENLIST_ADMIN_PASS" \
-            "http://localhost:${OPENLIST_PORT}/api/fs/list" \
+          # 1. 登录拿 JWT
+          login_resp=$(curl -s -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
             -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"${OPENLIST_ADMIN_PASS}\"}")
+          token=$(echo "$login_resp" | jq -r '.data.token // empty')
+          if [ -z "$token" ]; then
+            echo "::error::登录失败，响应: $login_resp"
+            echo "::error::若 message 提示 password incorrect，说明 OPENLIST_ADMIN_PASSWORD 与 data.db 里 admin 密码不一致。"
+            docker logs openlist || true
+            exit 1
+          fi
+          echo "Login OK"
+
+          # 2. 带 JWT 探测 Crypt 挂载点
+          resp=$(curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: $token" \
             -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}")
           code=$(echo "$resp" | jq -r '.code')
           if [ "$code" != "200" ]; then
@@ -351,10 +365,10 @@ jobs:
             docker logs openlist || true
             exit 1
           fi
-          # 脱敏：不输出完整响应体（可能含路径），只确认 200
           echo "Crypt mount OK"
 
       # ---------- 9. rclone 经 WebDAV 上传 ----------
+      # WebDAV 支持 Basic Auth（本地验证 PROPFIND 返回 207），rclone 配置用 user/pass 即可。
       - name: Upload via rclone WebDAV
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
