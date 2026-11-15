@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "下载链接。支持多行粘贴，只要包含 '链接|自定义文件名' 即可，无需管空格和换行。"
+        description: "下载链接。支持多行粘贴，包含 '链接|自定义文件名' 即可"
         required: true
         type: string
       tags:
@@ -137,13 +137,11 @@ jobs:
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
           # ================= 智能切分 =================
-          # 无论 GitHub 吞没吞换行，直接通过正则寻找 http/https 作为起点切割
           printf '%s' "$URLS" > raw_input.txt
           python3 -c "
           import re
           with open('raw_input.txt', 'r', encoding='utf-8') as f:
               content = f.read()
-          # 匹配 http:// 或 https:// 并以此为界切分
           parts = re.split(r'(?=https?://)', content)
           with open('urls_list.txt', 'w', encoding='utf-8') as f:
               for p in parts:
@@ -216,6 +214,10 @@ jobs:
             fi
             mv "work/download/source.bin" "work/download/$FINAL_NAME"
 
+            # 打印当前磁盘空间
+            echo "=== 当前磁盘剩余空间 ==="
+            df -h /
+
             # 处理压缩包
             if [ "$IS_ARCHIVE" == "true" ]; then
                echo "-> 解压中..."
@@ -255,9 +257,17 @@ jobs:
               ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" "$thumb_dir/$(basename "${rel%.*}").webp" 2>/dev/null || true
             done
 
-            # 上传
+            # ================= 上传 =================
             echo "-> 上传至移动云盘..."
-            rclone copy "work/output/videos" "ol:$DEST" --transfers 4 --multi-thread-streams 4 -q
+            # -P 显示进度；--transfers 1 单文件；--multi-thread-streams 2 拆分两线程；
+            # --timeout 30m 防止死等；--retries 3 失败重试；
+            rclone copy "work/output/videos" "ol:$DEST" \
+              --transfers 1 \
+              --multi-thread-streams 2 \
+              --timeout 30m \
+              --retries 3 \
+              -P
+              
             if [ -d "work/output/thumbs" ]; then
               rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q
             fi
