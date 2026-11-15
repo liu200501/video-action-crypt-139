@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "下载链接。支持单行或多个（用空格隔开），支持 '链接|自定义文件名' 格式"
+        description: "下载链接。支持多个，请用分号(;)隔开。格式：链接|自定义文件名"
         required: true
         type: string
       tags:
@@ -136,11 +136,16 @@ jobs:
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
-          # 3. 将多行/多链接按空格切分并循环
-          echo "$URLS" | tr ' ' '\n' | sed '/^$/d' > urls_list.txt
+          # ================= 关键修复：不要用空格切分！改用分号 ";" 作为边界 =================
+          echo "$URLS" | tr ';' '\n' | sed '/^$/d' > urls_list.txt
+          
           INDEX=1
           
           while IFS= read -r line; do
+            # 去掉开头和结尾的空白字符（防止分号前后有空格）
+            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$line" ] && continue
+
             echo "=================================================="
             echo "[$INDEX] 正在处理: $line"
             
@@ -152,7 +157,7 @@ jobs:
               CUSTOM_NAME="${line#*|}"
             fi
             
-            # 强制剥离 ?f=
+            # 强制剥离 ?f= （保留 e 和 s 签名）
             if [[ "$RAW_URL" == *"?f="* ]]; then
               BASE_URL="${RAW_URL%%\?*}"
               QUERY="${RAW_URL#*\?}"
