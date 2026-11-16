@@ -168,59 +168,63 @@ jobs:
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
-          # ================= 获取 OpenList API Token =================
-          echo "-> 获取 OpenList API Token..."
-          LOGIN_RESP=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg u admin --arg p "$OPENLIST_ADMIN_PASS" '{username: $u, password: $p}')")
-          OPENLIST_TOKEN=$(printf '%s' "$LOGIN_RESP" | jq -r '.data.token // empty')
-          if [ -z "$OPENLIST_TOKEN" ] || [ "$OPENLIST_TOKEN" = "null" ]; then
-            echo "::error::获取 OpenList API Token 失败，请检查 OPENLIST_ADMIN_PASSWORD"
-            exit 1
-          fi
-          echo "OpenList API Token 获取成功"
+          # ================= OpenList WebDAV 上传函数 =================
+          # 路径按 segment 做 URL 编码（保留 /），避免空格、中文、# ? % 等字符破坏 URL
+          dav_url() {
+            local p="$1"
+            local enc
+            enc=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$p")
+            printf 'http://localhost:%s/dav%s' "${OPENLIST_PORT}" "$enc"
+          }
 
-          # ================= OpenList fs/put 上传函数 =================
-          openlist_put() {
-            local src="$1"
-            local dst="$2"
-            local encoded
-            encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$dst")
-            local url="http://localhost:${OPENLIST_PORT}/api/fs/put?path=${encoded}"
-            local body http_code resp code
-            body=$(curl -sS -X PUT "$url" \
-              --upload-file "$src" \
-              --max-time 1800 --retry 2 --retry-delay 5 \
-              -H "Authorization: $OPENLIST_TOKEN" \
-              -H "Content-Type: application/octet-stream" \
-              -w '\n%{http_code}' 2>&1) || true
-            http_code=$(printf '%s' "$body" | tail -n1)
-            resp=$(printf '%s' "$body" | sed '$d')
-            if [ "$http_code" != "200" ]; then
-              echo "::error::上传失败 HTTP $http_code: $dst"
-              echo "响应: $resp"
-              return 1
-            fi
-            code=$(printf '%s' "$resp" | jq -r '.code // empty' 2>/dev/null || true)
-            if [ "$code" != "200" ]; then
-              echo "::error::上传失败 code=${code:-未知}: $dst"
-              echo "响应: $resp"
-              return 1
-            fi
+          # openlist_mkdir <OpenList 绝对路径>
+          openlist_mkdir() {
+            local dst="$1"
+            local url http_code
+            url=$(dav_url "$dst")
+            http_code=$(curl -sS -X MKCOL "$url" \
+              -u "admin:$OPENLIST_ADMIN_PASS" \
+              -w '\n%{http_code}' 2>&1 | tail -n1) || true
+            case "$http_code" in
+              201) echo "mkdir $dst -> 201 Created" ;;
+              405) echo "mkdir $dst -> 405 已存在" ;;
+              *)
+                echo "::warning::mkdir $dst 失败 HTTP $http_code"
+                return 1
+                ;;
+            esac
             return 0
           }
 
+          # openlist_put <本地文件> <OpenList 绝对路径>
+          openlist_put() {
+            local src="$1"
+            local dst="$2"
+            local url body http_code resp
+            url=$(dav_url "$dst")
+            body=$(curl -sS -X PUT "$url" \
+              -u "admin:$OPENLIST_ADMIN_PASS" \
+              --upload-file "$src" \
+              --max-time 1800 --retry 2 --retry-delay 5 \
+              -w '\n%{http_code}' 2>&1) || true
+            http_code=$(printf '%s' "$body" | tail -n1)
+            resp=$(printf '%s' "$body" | sed '$d')
+            case "$http_code" in
+              201|204) return 0 ;;
+              *)
+                echo "::error::上传失败 HTTP $http_code: $dst"
+                echo "响应: $resp"
+                return 1
+                ;;
+            esac
+          }
+
+          # openlist_put_dir <本地目录> <OpenList 绝对目标目录>（递归）
           openlist_put_dir() {
             local src_dir="$1"
             local dst_dir="$2"
             local fail=0
-            local mkdir_encoded mkdir_resp
-            mkdir_encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$dst_dir")
-            mkdir_resp=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/fs/mkdir" \
-              -H "Authorization: $OPENLIST_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -n --arg p "$mkdir_encoded" '{path: $p}')" 2>&1) || true
-            echo "mkdir $dst_dir -> $mkdir_resp"
+            openlist_mkdir "$dst_dir" || true
             while IFS= read -r -d '' f; do
               local rel="${f#"$src_dir"/}"
               echo "  PUT -> $dst_dir/$rel"
@@ -240,7 +244,7 @@ jobs:
             echo "| 全局参数 | 值 |"
             echo "| :--- | :--- |"
             echo "| **目标目录** | \`$DEST\` |"
-            echo "| **上传方式** | \`OpenList /api/fs/put\` |"
+            echo "| **上传方式** | \`OpenList WebDAV\` |"
             echo "| **是否为压缩包** | \`$IS_ARCHIVE\` |"
             echo "| **强制扩展名** | \`${EXT:-自动推断}\` |"
             echo "| **开始时间** | $START_TIME |"
@@ -517,6 +521,7 @@ jobs:
 
           echo "-> 上传缩略图至云端..."
           if [ -d "work/output/videos" ]; then
+            openlist_mkdir "$DEST/.thumbnails" || true
             THUMB_FAIL=0
             while IFS= read -r -d '' t; do
               rel="${t#work/output/videos/}"
