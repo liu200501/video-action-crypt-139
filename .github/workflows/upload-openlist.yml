@@ -51,6 +51,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ==================== 0. 清理磁盘 ====================
       - name: Free up disk space
         run: |
           echo "=== 清理前 ==="
@@ -61,6 +62,7 @@ jobs:
           echo "=== 清理后 ==="
           df -h
 
+      # ==================== 1. 拉取私有配置 ====================
       - name: Checkout secrets repo
         uses: actions/checkout@v4
         with:
@@ -81,12 +83,15 @@ jobs:
             gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENLIST_DB_GPG_PASS" --decrypt "${SECRET_DIR}/data.db-wal.gpg" > openlist/data/data.db-wal
           fi
 
+      # ==================== 2. 安装系统工具 ====================
       - name: Install tools
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg p7zip-full zip jq curl rclone file
+          pip install Pillow -q
 
+      # ==================== 3. 启动 OpenList 容器 ====================
       - name: Start OpenList container
         run: |
           docker run -d --name openlist -p ${OPENLIST_PORT}:5244 -v "${{ github.workspace }}/openlist/data:/opt/openlist/data" ${DOCKER_IMAGE}
@@ -105,6 +110,7 @@ jobs:
           curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" -H "Content-Type: application/json" -H "Authorization: $token" -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}" | jq -e '.code == 200' > /dev/null || { echo "::error::Crypt mount failed"; exit 1; }
           echo "Crypt mount OK"
 
+      # ==================== 4. 核心：处理、上传与摘要 ====================
       - name: Process and Upload sequentially
         env:
           URLS: ${{ inputs.url }}
@@ -126,11 +132,9 @@ jobs:
           START_TS=$(date +%s)
           START_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
 
-          # 初始化错误统计与重命名列表文件
           ERROR_COUNT=0
           RENAME_LIST=""
 
-          # 提前写入摘要头部
           {
             echo "## 📦 Upload Task: ${CLEAN_TAGS}"
             echo ""
@@ -139,7 +143,6 @@ jobs:
             echo "| **目标目录** | \`$DEST\` |"
             echo "| **是否为压缩包** | \`$IS_ARCHIVE\` |"
             echo "| **强制扩展名** | \`${EXT:-自动推断}\` |"
-            echo "| **Referer** | \`${REFERER:-无}\` |"
             echo "| **开始时间** | $START_TIME |"
             echo ""
             echo "### 📄 文件处理详情"
@@ -158,7 +161,7 @@ jobs:
           pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
           EOF
 
-          # 智能切分
+          # 智能切分链接
           printf '%s' "$URLS" > raw_input.txt
           python3 -c "
           import re
@@ -175,6 +178,7 @@ jobs:
           INDEX=1
           TOTAL_BYTES=0
 
+          # ================= 循环下载与处理 =================
           while IFS= read -r line; do
             [ -z "$line" ] && continue
 
@@ -188,6 +192,7 @@ jobs:
               CUSTOM_NAME="${line#*|}"
             fi
 
+            # 剥离 ?f=
             if [[ "$RAW_URL" == *"?f="* ]]; then
               BASE_URL="${RAW_URL%%\?*}"
               QUERY="${RAW_URL#*\?}"
@@ -200,6 +205,7 @@ jobs:
             fi
             PURE_URL="$RAW_URL"
 
+            # 预获取文件大小
             UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
             HEAD_ARGS=(-sIL --connect-timeout 10 -A "$UA")
             if [ -n "$REFERER" ]; then HEAD_ARGS+=(-e "$REFERER"); fi
@@ -213,13 +219,12 @@ jobs:
                TOTAL_BYTES=$((TOTAL_BYTES + FILE_SIZE_BYTES))
             fi
 
-            mkdir -p "work/download" "work/output/videos" "work/output/thumbs"
+            mkdir -p "work/download" "work/output/videos"
 
             echo "-> 下载中..."
             CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
             if [ -n "$REFERER" ]; then CURL_ARGS+=(-e "$REFERER"); fi
 
-            # 使用 set +e 和 set -e 包裹，防止 curl 失败直接中断整个步骤
             set +e
             curl "${CURL_ARGS[@]}" -o "work/download/source.bin" "$RAW_URL"
             CURL_EXIT=$?
@@ -233,6 +238,7 @@ jobs:
                continue
             fi
 
+            # 重命名逻辑
             FINAL_NAME="source.mp4"
             if [ "$IS_ARCHIVE" != "true" ]; then
               ext="$EXT"
@@ -259,8 +265,8 @@ jobs:
 
             if [ "$IS_ARCHIVE" == "true" ]; then
                echo "-> 解压中..."
-               7z x -y -owork/extracted "work/download/$FINAL_NAME" >/dev/null
-               find work/extracted -type f | while read -r f; do
+               7z x -y -owork/extracted "work/download/$FINAL_NAME" >/dev/null 2>&1 || true
+               find work/extracted -type f 2>/dev/null | while read -r f; do
                  if [[ "$f" =~ \.(mp4|mkv|avi|mov|flv|wmv|ts|m2ts|webm|m4v|mpg|mpeg|rmvb|3gp)$ ]]; then
                    mkdir -p "work/output/videos/$(dirname "${f#work/extracted/}")"
                    mv "$f" "work/output/videos/${f#work/extracted/}"
@@ -284,16 +290,7 @@ jobs:
               fi
             done
 
-            echo "-> 生成缩略图..."
-            find work/output/videos -type f | while read -r f; do
-              rel="${f#work/output/videos/}"
-              thumb_dir="work/output/thumbs/$(dirname "$rel")/.thumbnails"
-              mkdir -p "$thumb_dir"
-              dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo 10)
-              at=$(awk -v d="$dur" 'BEGIN{print (d>10)?int(d*0.1):1}')
-              ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" "$thumb_dir/$(basename "${rel%.*}").webp" 2>/dev/null || true
-            done
-
+            # ================= 上传 =================
             echo "-> 上传至移动云盘..."
             UPLOAD_STATUS="✅ 上传成功"
             
@@ -307,19 +304,146 @@ jobs:
                ERROR_COUNT=$((ERROR_COUNT + 1))
             fi
 
-            if [ -d "work/output/thumbs" ]; then
-              rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q || true
-            fi
-
             echo "| $INDEX | [链接]($PURE_URL) | \`$FINAL_NAME\` | $HUMAN_SIZE | $UPLOAD_STATUS |" >> "$GITHUB_STEP_SUMMARY"
             
             if [ "$IS_ARCHIVE" != "true" ]; then
               RENAME_LIST="${RENAME_LIST}${PURE_URL}|${FINAL_NAME}"$'\n'
             fi
 
-            rm -rf work/download/* work/output/videos/* work/output/thumbs/*
+            rm -rf work/download/* work/output/videos/*
             INDEX=$((INDEX + 1))
           done < urls_list.txt
+
+          # ================= 加入 Python 脚本生成缩略图 =================
+          echo "=================================================="
+          echo "-> 开始批量生成缩略图 (并发模式)..."
+          
+          cat > gen_thumb.py << 'PYEOF'
+          import os
+          import subprocess
+          import sys
+          import time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from PIL import Image
+
+          CAPTURE_TIME = "00:00:01"
+          MAX_SIZE = 320
+          WEBP_QUALITY = 80
+          MAX_WORKERS = min(8, (os.cpu_count() or 4))
+
+          VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.ts', '.m2ts', '.webm'}
+          IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+
+          def get_ffmpeg():
+              exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+              local_ffmpeg = os.path.join(exe_dir, "ffmpeg.exe")
+              if os.path.isfile(local_ffmpeg):
+                  return local_ffmpeg
+              return "ffmpeg"
+
+          def generate_video_thumbnail(video_path, thumb_path, ffmpeg):
+              cmd = [
+                  ffmpeg, "-y",
+                  "-ss", CAPTURE_TIME, "-i", video_path,
+                  "-ss", "00:00:01",
+                  "-vframes", "1",
+                  "-vf", f"scale={MAX_SIZE}:-2",
+                  "-threads", "1",
+                  "-c:v", "libwebp", "-quality", str(WEBP_QUALITY),
+                  thumb_path
+              ]
+              try:
+                  subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+                  return True
+              except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                  cmd_fallback = [
+                      ffmpeg, "-y", "-i", video_path, "-vframes", "1",
+                      "-vf", f"scale={MAX_SIZE}:-2", "-threads", "1",
+                      "-c:v", "libwebp", "-quality", str(WEBP_QUALITY), thumb_path
+                  ]
+                  try:
+                      subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+                      return True
+                  except Exception:
+                      if os.path.exists(thumb_path):
+                          try: os.remove(thumb_path)
+                          except OSError: pass
+                      return False
+
+          def generate_image_thumbnail(image_path, thumb_path):
+              try:
+                  with Image.open(image_path) as img:
+                      if img.format == "JPEG":
+                          img.draft("RGB", (MAX_SIZE * 2, MAX_SIZE * 2))
+                      if img.mode in ("RGBA", "P", "LA"):
+                          img = img.convert("RGB")
+                      img.thumbnail((MAX_SIZE, MAX_SIZE), Image.Resampling.BILINEAR)
+                      img.save(thumb_path, "WEBP", quality=WEBP_QUALITY, method=4)
+                  return True
+              except Exception:
+                  if os.path.exists(thumb_path):
+                      try: os.remove(thumb_path)
+                      except OSError: pass
+                  return False
+
+          def process_one(media_path, thumb_path, ext, ffmpeg):
+              if os.path.exists(thumb_path): return ("skip", os.path.basename(media_path))
+              if ext in VIDEO_EXTENSIONS:
+                  ok = generate_video_thumbnail(media_path, thumb_path, ffmpeg)
+                  return ("video_ok" if ok else "video_fail", os.path.basename(media_path))
+              elif ext in IMAGE_EXTENSIONS:
+                  ok = generate_image_thumbnail(media_path, thumb_path)
+                  return ("image_ok" if ok else "image_fail", os.path.basename(media_path))
+              return ("unknown", os.path.basename(media_path))
+
+          def main():
+              target_dir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+              if not os.path.isdir(target_dir): return
+              ffmpeg = get_ffmpeg()
+              
+              tasks = []
+              for root, dirs, files in os.walk(target_dir):
+                  if '.thumbnails' in dirs: dirs.remove('.thumbnails')
+                  medias = [f for f in files if os.path.splitext(f)[1].lower() in (VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)]
+                  if not medias: continue
+                  thumb_dir = os.path.join(root, ".thumbnails")
+                  os.makedirs(thumb_dir, exist_ok=True)
+                  for media in medias:
+                      # 注意这里：OpenList 要求缩略图名为 [原文件名.原扩展名.webp]
+                      tasks.append((os.path.join(root, media), os.path.join(thumb_dir, f"{media}.webp"), os.path.splitext(media)[1].lower()))
+
+              if not tasks: return
+              
+              stats = {"skip": 0, "video_ok": 0, "video_fail": 0, "image_ok": 0, "image_fail": 0, "unknown": 0}
+              with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                  futures = {pool.submit(process_one, mp, tp, ext, ffmpeg): mp for (mp, tp, ext) in tasks}
+                  for fut in as_completed(futures):
+                      try:
+                          status, name = fut.result()
+                          stats[status] = stats.get(status, 0) + 1
+                          print(f"  [{status}] {name}")
+                      except Exception as e:
+                          print(f"  [异常] {e}")
+
+              success = stats["skip"] + stats["video_ok"] + stats["image_ok"]
+              failed = stats["video_fail"] + stats["image_fail"] + stats["unknown"]
+              print(f"✅ 缩略图生成完成！成功 {success}，失败 {failed}")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          # 执行 Python 脚本批量生成缩略图
+          python3 gen_thumb.py "work/output/videos"
+
+          # 将生成的缩略图统一步骤上传
+          echo "-> 上传缩略图至云端..."
+          if [ -d "work/output/videos" ]; then
+             rclone copy "work/output/videos" "ol:$DEST" --include ".thumbnails/**" --transfers 4 -q || true
+          fi
+
+          # 清理临时生成脚本
+          rm -f gen_thumb.py
 
           # ================= 结束时计算时间与速度 =================
           END_TS=$(date +%s)
@@ -373,6 +497,7 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ==================== 5. 清理容器 ====================
       - name: Dump OpenList logs on failure
         if: failure()
         run: docker logs --tail 200 openlist || true
