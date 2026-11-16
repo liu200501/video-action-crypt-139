@@ -35,6 +35,7 @@ on:
 
 env:
   OPENLIST_PORT: 5244
+  # ⚠️ 方案 A：这个路径现在必须是 OpenList 里的【普通存储目录】，不能是 Crypt 挂载点
   CRYPT_MOUNT: /加密存储
   DOCKER_IMAGE: openlistteam/openlist:latest
   WORK_DIR: ${{ github.workspace }}/work
@@ -100,15 +101,32 @@ jobs:
             sleep 2
           done
 
-      - name: Check Crypt mount connectivity
+      # ==================== 3.5 检查 rclone crypt remote 连通性（方案 A 新增）====================
+      - name: Check rclone crypt remote
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+          RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
+          RCLONE_CRYPT_PASSWORD2: ${{ secrets.RCLONE_CRYPT_PASSWORD2 }}
         run: |
-          login_resp=$(curl -s -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"${OPENLIST_ADMIN_PASS}\"}")
-          token=$(echo "$login_resp" | jq -r '.data.token // empty')
-          [ -z "$token" ] && { echo "::error::Login failed"; exit 1; }
-          curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" -H "Content-Type: application/json" -H "Authorization: $token" -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}" | jq -e '.code == 200' > /dev/null || { echo "::error::Crypt mount failed"; exit 1; }
-          echo "Crypt mount OK"
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [ol]
+          type = webdav
+          url = http://localhost:${OPENLIST_PORT}/dav
+          vendor = other
+          user = admin
+          pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
+
+          [ol-crypt]
+          type = crypt
+          remote = ol:${CRYPT_MOUNT}
+          filename_encoding = base64
+          password = $(rclone obscure "$RCLONE_CRYPT_PASSWORD")
+          password2 = $(rclone obscure "$RCLONE_CRYPT_PASSWORD2")
+          EOF
+          rclone lsd ol-crypt: || { echo "::error::rclone crypt remote 无法列出，请检查 OpenList 目录与 crypt 密码"; exit 1; }
+          echo "rclone crypt remote OK"
 
       # ==================== 4. 核心：处理、上传与摘要 ====================
       - name: Process and Upload sequentially
@@ -119,6 +137,8 @@ jobs:
           REFERER: ${{ inputs.referer }}
           USER_AGENT: ${{ inputs.user_agent }}
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+          RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
+          RCLONE_CRYPT_PASSWORD2: ${{ secrets.RCLONE_CRYPT_PASSWORD2 }}
           TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
@@ -126,7 +146,10 @@ jobs:
           # ================= 动态摘要初始化 =================
           CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
+          # 展示用（OpenList 视角的路径）
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
+          # rclone crypt 视角的目标（相对 ol-crypt remote 根）
+          CRYPT_DEST="${CLEAN_TAGS}"
 
           # 记录开始时间
           START_TS=$(date +%s)
@@ -141,6 +164,7 @@ jobs:
             echo "| 全局参数 | 值 |"
             echo "| :--- | :--- |"
             echo "| **目标目录** | \`$DEST\` |"
+            echo "| **rclone 目标** | \`ol-crypt:$CRYPT_DEST\` |"
             echo "| **是否为压缩包** | \`$IS_ARCHIVE\` |"
             echo "| **强制扩展名** | \`${EXT:-自动推断}\` |"
             echo "| **开始时间** | $START_TIME |"
@@ -150,7 +174,7 @@ jobs:
             echo "| :--- | :--- | :--- | :--- | :--- |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # 初始化 rclone 配置
+          # 初始化 rclone 配置（含 crypt remote）
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
           [ol]
@@ -159,6 +183,13 @@ jobs:
           vendor = other
           user = admin
           pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
+
+          [ol-crypt]
+          type = crypt
+          remote = ol:${CRYPT_MOUNT}
+          filename_encoding = base64
+          password = $(rclone obscure "$RCLONE_CRYPT_PASSWORD")
+          password2 = $(rclone obscure "$RCLONE_CRYPT_PASSWORD2")
           EOF
 
           # 智能切分链接
@@ -209,7 +240,7 @@ jobs:
             UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
             HEAD_ARGS=(-sIL --connect-timeout 10 -A "$UA")
             if [ -n "$REFERER" ]; then HEAD_ARGS+=(-e "$REFERER"); fi
-            
+
             FILE_SIZE_BYTES=$(curl "${HEAD_ARGS[@]}" "$PURE_URL" | grep -i '^content-length:' | tail -n1 | awk '{print $2}' | tr -d '\r' || echo "0")
             if [ -z "$FILE_SIZE_BYTES" ] || [ "$FILE_SIZE_BYTES" -eq 0 ]; then
                HUMAN_SIZE="未知"
@@ -290,22 +321,25 @@ jobs:
               fi
             done
 
-            # ================= 上传 =================
-            echo "-> 上传至移动云盘..."
+            # ================= 上传（方案 A：走 ol-crypt）=================
+            echo "-> 上传至 OpenList（rclone crypt 加密）..."
             UPLOAD_STATUS="✅ 上传成功"
-            
+
             set +e
-            rclone copy "work/output/videos" "ol:$DEST" --transfers 1 --multi-thread-streams 2 --timeout 30m --retries 3 -P
+            rclone copy "work/output/videos" "ol-crypt:$CRYPT_DEST" \
+              --transfers 1 --multi-thread-streams 2 \
+              --timeout 5m --retries 2 \
+              --ignore-checksum --log-level DEBUG -P
             RCLONE_EXIT=$?
             set -e
 
             if [ "$RCLONE_EXIT" -ne 0 ]; then
-               UPLOAD_STATUS="❌ 上传失败"
+               UPLOAD_STATUS="❌ 上传失败 (exit $RCLONE_EXIT)"
                ERROR_COUNT=$((ERROR_COUNT + 1))
             fi
 
             echo "| $INDEX | [链接]($PURE_URL) | \`$FINAL_NAME\` | $HUMAN_SIZE | $UPLOAD_STATUS |" >> "$GITHUB_STEP_SUMMARY"
-            
+
             if [ "$IS_ARCHIVE" != "true" ]; then
               RENAME_LIST="${RENAME_LIST}${PURE_URL}|${FINAL_NAME}"$'\n'
             fi
@@ -317,7 +351,7 @@ jobs:
           # ================= 加入 Python 脚本生成缩略图 =================
           echo "=================================================="
           echo "-> 开始批量生成缩略图 (并发模式)..."
-          
+
           cat > gen_thumb.py << 'PYEOF'
           import os
           import subprocess
@@ -400,7 +434,7 @@ jobs:
               target_dir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
               if not os.path.isdir(target_dir): return
               ffmpeg = get_ffmpeg()
-              
+
               tasks = []
               for root, dirs, files in os.walk(target_dir):
                   if '.thumbnails' in dirs: dirs.remove('.thumbnails')
@@ -413,7 +447,7 @@ jobs:
                       tasks.append((os.path.join(root, media), os.path.join(thumb_dir, f"{media}.webp"), os.path.splitext(media)[1].lower()))
 
               if not tasks: return
-              
+
               stats = {"skip": 0, "video_ok": 0, "video_fail": 0, "image_ok": 0, "image_fail": 0, "unknown": 0}
               with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                   futures = {pool.submit(process_one, mp, tp, ext, ffmpeg): mp for (mp, tp, ext) in tasks}
@@ -436,10 +470,10 @@ jobs:
           # 执行 Python 脚本批量生成缩略图
           python3 gen_thumb.py "work/output/videos"
 
-          # 将生成的缩略图统一步骤上传
+          # 将生成的缩略图统一步骤上传（方案 A：走 ol-crypt）
           echo "-> 上传缩略图至云端..."
           if [ -d "work/output/videos" ]; then
-             rclone copy "work/output/videos" "ol:$DEST" --include ".thumbnails/**" --transfers 4 -q || true
+             rclone copy "work/output/videos" "ol-crypt:$CRYPT_DEST" --include ".thumbnails/**" --transfers 4 -q || true
           fi
 
           # 清理临时生成脚本
@@ -449,7 +483,7 @@ jobs:
           END_TS=$(date +%s)
           END_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
           ELAPSED=$((END_TS - START_TS))
-          
+
           if [ "$ELAPSED" -eq 0 ]; then ELAPSED=1; fi
 
           if [ "$TOTAL_BYTES" -eq 0 ]; then
@@ -461,9 +495,9 @@ jobs:
             HUMAN_SPEED=$(numfmt --to=iec-i --suffix=B/s "$SPEED_BPS")
             SPEED_STR="$HUMAN_SPEED"
           fi
-          
+
           FORMAT_TIME=$(printf '%02d:%02d:%02d' $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))
-          
+
           if [ "$ERROR_COUNT" -gt 0 ]; then
             ERROR_MSG="⚠️ 共有 $ERROR_COUNT 个文件处理失败，请检查上方日志。"
           else
@@ -482,11 +516,11 @@ jobs:
             echo "| **等效速度** | $SPEED_STR |"
             echo "| **运行状态** | $ERROR_MSG |"
             echo ""
-            echo "> 远端存储统计："
+            echo "> 远端存储统计（rclone crypt 视角）："
             echo "\`\`\`"
-            rclone size "ol:$DEST"
+            rclone size "ol-crypt:$CRYPT_DEST" || true
             echo "\`\`\`"
-            
+
             if [ -n "$RENAME_LIST" ]; then
               echo ""
               echo "### 📋 可复用的下载链接与重命名列表"
