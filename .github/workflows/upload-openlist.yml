@@ -35,7 +35,6 @@ on:
 
 env:
   OPENLIST_PORT: 5244
-  # ⚠️ 方案 A：这个路径现在必须是 OpenList 里的【普通存储目录】，不能是 Crypt 挂载点
   CRYPT_MOUNT: /加密存储
   DOCKER_IMAGE: openlistteam/openlist:latest
   WORK_DIR: ${{ github.workspace }}/work
@@ -101,43 +100,39 @@ jobs:
             sleep 2
           done
 
-      # ==================== 3.2 探测 fs/put API 是否可用 ====================
-      - name: Probe OpenList fs/put API
+      # ==================== 3.1 调试：存储列表 + 139 连通性 ====================
+      - name: Debug OpenList storages and 139 connectivity
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          LOGIN_RESP=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
+          TOKEN=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg u admin --arg p "$OPENLIST_ADMIN_PASS" '{username: $u, password: $p}')")
-          TOKEN=$(printf '%s' "$LOGIN_RESP" | jq -r '.data.token // empty')
+            -d "$(jq -n --arg u admin --arg p "$OPENLIST_ADMIN_PASS" '{username:$u,password:$p}')" | jq -r '.data.token // empty')
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "::error::探测失败：无法获取 OpenList API Token"
+            echo "::error::登录失败，无法获取 token"
             exit 1
           fi
 
-          PROBE_LOCAL="probe.txt"
-          PROBE_REMOTE="${CRYPT_MOUNT}/.put-probe-$(date +%s).txt"
-          echo "probe $(date -u +%FT%TZ)" > "$PROBE_LOCAL"
-          ENCODED=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$PROBE_REMOTE")
-          URL="http://localhost:${OPENLIST_PORT}/api/fs/put?path=${ENCODED}"
-
-          BODY=$(curl -sS -X PUT "$URL" \
-            --upload-file "$PROBE_LOCAL" \
-            --max-time 300 --retry 2 --retry-delay 5 \
+          echo "=== OpenList 存储列表 ==="
+          curl -sS "http://localhost:${OPENLIST_PORT}/api/admin/storage/list" \
             -H "Authorization: $TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            -w '\n%{http_code}' 2>&1) || true
-          HTTP_CODE=$(printf '%s' "$BODY" | tail -n1)
-          RESP=$(printf '%s' "$BODY" | sed '$d')
-          echo "HTTP $HTTP_CODE : $RESP"
-          if [ "$HTTP_CODE" != "200" ] || [ "$(printf '%s' "$RESP" | jq -r '.code // empty')" != "200" ]; then
-            echo "::error::fs/put API 探测失败（HTTP $HTTP_CODE），请检查 OpenList 版本与管理密码"
-            exit 1
-          fi
-          echo "fs/put API 探测成功：$PROBE_REMOTE"
+            | jq '.data.content[]? | {mount_path, driver, status, disabled, addition}' || true
 
-      # ==================== 3.5 准备 rclone 配置（仅用于统计，上传走 fs/put API）====================
+          echo ""
+          echo "=== 移动云盘 (user-njs.yun.139.com) 连通性 ==="
+          echo -n "默认: "
+          curl -sS -m 10 -o /dev/null -w "%{http_code}\n" https://user-njs.yun.139.com/ || echo "failed"
+          echo -n "强制 IPv4: "
+          curl -4 -sS -m 10 -o /dev/null -w "%{http_code}\n" https://user-njs.yun.139.com/ || echo "ipv4 failed"
+          echo -n "强制 IPv6: "
+          curl -6 -sS -m 10 -o /dev/null -w "%{http_code}\n" https://user-njs.yun.139.com/ || echo "ipv6 failed"
+
+          echo ""
+          echo "=== DNS 解析 ==="
+          getent ahosts user-njs.yun.139.com || true
+
+      # ==================== 3.5 准备 rclone 配置（仅用于统计）====================
       - name: Prepare rclone config (stats only)
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
@@ -171,7 +166,6 @@ jobs:
           # ================= 动态摘要初始化 =================
           CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
-          # 目标目录（OpenList 视角的绝对路径）
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
 
           # ================= 获取 OpenList API Token =================
@@ -187,7 +181,6 @@ jobs:
           echo "OpenList API Token 获取成功"
 
           # ================= OpenList fs/put 上传函数 =================
-          # openlist_put <本地文件> <OpenList 绝对路径>
           openlist_put() {
             local src="$1"
             local dst="$2"
@@ -217,7 +210,6 @@ jobs:
             return 0
           }
 
-          # openlist_put_dir <本地目录> <OpenList 绝对目标目录>（递归）
           openlist_put_dir() {
             local src_dir="$1"
             local dst_dir="$2"
@@ -230,10 +222,8 @@ jobs:
             return "$fail"
           }
 
-          # 记录开始时间
           START_TS=$(date +%s)
           START_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
-
           ERROR_COUNT=0
           RENAME_LIST=""
 
@@ -253,7 +243,6 @@ jobs:
             echo "| :--- | :--- | :--- | :--- | :--- |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # 智能切分链接
           printf '%s' "$URLS" > raw_input.txt
           python3 -c "
           import re
@@ -270,10 +259,8 @@ jobs:
           INDEX=1
           TOTAL_BYTES=0
 
-          # ================= 循环下载与处理 =================
           while IFS= read -r line; do
             [ -z "$line" ] && continue
-
             echo "=================================================="
             echo "[$INDEX] 正在处理: $line"
 
@@ -284,7 +271,6 @@ jobs:
               CUSTOM_NAME="${line#*|}"
             fi
 
-            # 剥离 ?f=
             if [[ "$RAW_URL" == *"?f="* ]]; then
               BASE_URL="${RAW_URL%%\?*}"
               QUERY="${RAW_URL#*\?}"
@@ -297,7 +283,6 @@ jobs:
             fi
             PURE_URL="$RAW_URL"
 
-            # 预获取文件大小
             UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
             HEAD_ARGS=(-sIL --connect-timeout 10 -A "$UA")
             if [ -n "$REFERER" ]; then HEAD_ARGS+=(-e "$REFERER"); fi
@@ -330,7 +315,6 @@ jobs:
                continue
             fi
 
-            # 重命名逻辑
             FINAL_NAME="source.mp4"
             if [ "$IS_ARCHIVE" != "true" ]; then
               ext="$EXT"
@@ -382,7 +366,6 @@ jobs:
               fi
             done
 
-            # ================= 上传（调用 OpenList /api/fs/put）=================
             echo "-> 上传至 OpenList（fs/put API）..."
             UPLOAD_STATUS="✅ 上传成功"
 
@@ -406,7 +389,6 @@ jobs:
             INDEX=$((INDEX + 1))
           done < urls_list.txt
 
-          # ================= 加入 Python 脚本生成缩略图 =================
           echo "=================================================="
           echo "-> 开始批量生成缩略图 (并发模式)..."
 
@@ -501,7 +483,6 @@ jobs:
                   thumb_dir = os.path.join(root, ".thumbnails")
                   os.makedirs(thumb_dir, exist_ok=True)
                   for media in medias:
-                      # 注意这里：OpenList 要求缩略图名为 [原文件名.原扩展名.webp]
                       tasks.append((os.path.join(root, media), os.path.join(thumb_dir, f"{media}.webp"), os.path.splitext(media)[1].lower()))
 
               if not tasks: return
@@ -525,10 +506,8 @@ jobs:
               main()
           PYEOF
 
-          # 执行 Python 脚本批量生成缩略图
           python3 gen_thumb.py "work/output/videos"
 
-          # 将生成的缩略图逐个上传（OpenList /api/fs/put）
           echo "-> 上传缩略图至云端..."
           if [ -d "work/output/videos" ]; then
             THUMB_FAIL=0
@@ -543,14 +522,11 @@ jobs:
             fi
           fi
 
-          # 清理临时生成脚本
           rm -f gen_thumb.py
 
-          # ================= 结束时计算时间与速度 =================
           END_TS=$(date +%s)
           END_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
           ELAPSED=$((END_TS - START_TS))
-
           if [ "$ELAPSED" -eq 0 ]; then ELAPSED=1; fi
 
           if [ "$TOTAL_BYTES" -eq 0 ]; then
