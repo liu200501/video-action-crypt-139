@@ -101,6 +101,42 @@ jobs:
             sleep 2
           done
 
+      # ==================== 3.2 探测 fs/put API 是否可用 ====================
+      - name: Probe OpenList fs/put API
+        env:
+          OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          LOGIN_RESP=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg u admin --arg p "$OPENLIST_ADMIN_PASS" '{username: $u, password: $p}')")
+          TOKEN=$(printf '%s' "$LOGIN_RESP" | jq -r '.data.token // empty')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::探测失败：无法获取 OpenList API Token"
+            exit 1
+          fi
+
+          PROBE_LOCAL="probe.txt"
+          PROBE_REMOTE="${CRYPT_MOUNT}/.put-probe-$(date +%s).txt"
+          echo "probe $(date -u +%FT%TZ)" > "$PROBE_LOCAL"
+          ENCODED=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$PROBE_REMOTE")
+          URL="http://localhost:${OPENLIST_PORT}/api/fs/put?path=${ENCODED}"
+
+          BODY=$(curl -sS -X PUT "$URL" \
+            --upload-file "$PROBE_LOCAL" \
+            --max-time 300 --retry 2 --retry-delay 5 \
+            -H "Authorization: $TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -w '\n%{http_code}' 2>&1) || true
+          HTTP_CODE=$(printf '%s' "$BODY" | tail -n1)
+          RESP=$(printf '%s' "$BODY" | sed '$d')
+          echo "HTTP $HTTP_CODE : $RESP"
+          if [ "$HTTP_CODE" != "200" ] || [ "$(printf '%s' "$RESP" | jq -r '.code // empty')" != "200" ]; then
+            echo "::error::fs/put API 探测失败（HTTP $HTTP_CODE），请检查 OpenList 版本与管理密码"
+            exit 1
+          fi
+          echo "fs/put API 探测成功：$PROBE_REMOTE"
+
       # ==================== 3.5 准备 rclone 配置（仅用于统计，上传走 fs/put API）====================
       - name: Prepare rclone config (stats only)
         env:
@@ -157,14 +193,13 @@ jobs:
             local dst="$2"
             local encoded
             encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$dst")
-            local url="http://localhost:${OPENLIST_PORT}/api/fs/put"
+            local url="http://localhost:${OPENLIST_PORT}/api/fs/put?path=${encoded}"
             local body http_code resp code
             body=$(curl -sS -X PUT "$url" \
               --upload-file "$src" \
               --max-time 1800 --retry 2 --retry-delay 5 \
               -H "Authorization: $OPENLIST_TOKEN" \
               -H "Content-Type: application/octet-stream" \
-              -H "File-Path: $encoded" \
               -w '\n%{http_code}' 2>&1) || true
             http_code=$(printf '%s' "$body" | tail -n1)
             resp=$(printf '%s' "$body" | sed '$d')
