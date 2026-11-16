@@ -1,3 +1,110 @@
+name: Upload to OpenList Crypt
+run-name: "📦 ${{ inputs.tags || 'Auto' }} (Upload to OpenList)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "下载链接。支持多行粘贴，包含 '链接|自定义文件名' 即可"
+        required: true
+        type: string
+      tags:
+        description: "目标文件夹名"
+        required: true
+        type: string
+      is_archive:
+        description: "下载的是压缩包吗？"
+        required: true
+        default: false
+        type: boolean
+      ext:
+        description: "非压缩包时的扩展名（留空自动推断）"
+        required: false
+        default: ""
+        type: string
+      referer:
+        description: "Referer (防防盗链)"
+        required: false
+        default: "https://pawchive.pw/"
+        type: string
+      user_agent:
+        description: "User-Agent（留空默认 Chrome）"
+        required: false
+        default: ""
+        type: string
+
+env:
+  OPENLIST_PORT: 5244
+  CRYPT_MOUNT: /加密存储
+  DOCKER_IMAGE: openlistteam/openlist:latest
+  WORK_DIR: ${{ github.workspace }}/work
+  SECRET_DIR: openlist-secrets
+
+jobs:
+  upload:
+    name: "Upload: ${{ inputs.tags }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: openlist-crypt
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          echo "=== 清理前 ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+          echo "=== 清理后 ==="
+          df -h
+
+      - name: Checkout secrets repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SECRET_REPO }}
+          token: ${{ secrets.OPENLIST_SECRETS_TOKEN }}
+          path: openlist-secrets
+
+      - name: Restore OpenList config
+        env:
+          OPENLIST_CONFIG_JSON_B64: ${{ secrets.OPENLIST_CONFIG_JSON_B64 }}
+          OPENLIST_DB_GPG_PASS: ${{ secrets.OPENLIST_DB_GPG_PASS }}
+        run: |
+          set -euo pipefail
+          mkdir -p openlist/data
+          printf '%s' "$OPENLIST_CONFIG_JSON_B64" | base64 -d > openlist/data/config.json
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENLIST_DB_GPG_PASS" --decrypt "${SECRET_DIR}/data.db.gpg" > openlist/data/data.db
+          if [ -f "${SECRET_DIR}/data.db-wal.gpg" ]; then
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENLIST_DB_GPG_PASS" --decrypt "${SECRET_DIR}/data.db-wal.gpg" > openlist/data/data.db-wal
+          fi
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg p7zip-full zip jq curl rclone file
+
+      - name: Start OpenList container
+        run: |
+          docker run -d --name openlist -p ${OPENLIST_PORT}:5244 -v "${{ github.workspace }}/openlist/data:/opt/openlist/data" ${DOCKER_IMAGE}
+          for i in $(seq 1 60); do
+            if curl -sf "http://localhost:${OPENLIST_PORT}/ping" >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+      - name: Check Crypt mount connectivity
+        env:
+          OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
+        run: |
+          login_resp=$(curl -s -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"${OPENLIST_ADMIN_PASS}\"}")
+          token=$(echo "$login_resp" | jq -r '.data.token // empty')
+          [ -z "$token" ] && { echo "::error::Login failed"; exit 1; }
+          curl -s "http://localhost:${OPENLIST_PORT}/api/fs/list" -H "Content-Type: application/json" -H "Authorization: $token" -d "{\"path\":\"${CRYPT_MOUNT}\",\"page\":1,\"per_page\":1}" | jq -e '.code == 200' > /dev/null || { echo "::error::Crypt mount failed"; exit 1; }
+          echo "Crypt mount OK"
+
       - name: Process and Upload sequentially
         env:
           URLS: ${{ inputs.url }}
@@ -74,7 +181,6 @@
             echo "=================================================="
             echo "[$INDEX] 正在处理: $line"
 
-            # 解析链接和文件名
             RAW_URL="$line"
             CUSTOM_NAME=""
             if [[ "$line" == *"|"* ]]; then
@@ -82,7 +188,6 @@
               CUSTOM_NAME="${line#*|}"
             fi
 
-            # 剥离 ?f=
             if [[ "$RAW_URL" == *"?f="* ]]; then
               BASE_URL="${RAW_URL%%\?*}"
               QUERY="${RAW_URL#*\?}"
@@ -95,7 +200,6 @@
             fi
             PURE_URL="$RAW_URL"
 
-            # 预获取文件大小
             UA="${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36}"
             HEAD_ARGS=(-sIL --connect-timeout 10 -A "$UA")
             if [ -n "$REFERER" ]; then HEAD_ARGS+=(-e "$REFERER"); fi
@@ -115,7 +219,13 @@
             CURL_ARGS=(-fL --retry 3 --retry-delay 5 --connect-timeout 30 -A "$UA")
             if [ -n "$REFERER" ]; then CURL_ARGS+=(-e "$REFERER"); fi
 
-            if ! curl "${CURL_ARGS[@]}" -o "work/download/source.bin" "$RAW_URL"; then
+            # 使用 set +e 和 set -e 包裹，防止 curl 失败直接中断整个步骤
+            set +e
+            curl "${CURL_ARGS[@]}" -o "work/download/source.bin" "$RAW_URL"
+            CURL_EXIT=$?
+            set -e
+
+            if [ "$CURL_EXIT" -ne 0 ]; then
                echo "::error::下载失败 $RAW_URL"
                echo "| $INDEX | \`$PURE_URL\` | - | $HUMAN_SIZE | ❌ 下载失败 |" >> "$GITHUB_STEP_SUMMARY"
                ERROR_COUNT=$((ERROR_COUNT + 1))
@@ -123,7 +233,6 @@
                continue
             fi
 
-            # 重命名逻辑
             FINAL_NAME="source.mp4"
             if [ "$IS_ARCHIVE" != "true" ]; then
               ext="$EXT"
@@ -148,7 +257,6 @@
             fi
             mv "work/download/source.bin" "work/download/$FINAL_NAME"
 
-            # 处理压缩包
             if [ "$IS_ARCHIVE" == "true" ]; then
                echo "-> 解压中..."
                7z x -y -owork/extracted "work/download/$FINAL_NAME" >/dev/null
@@ -164,7 +272,6 @@
                mv "work/download/$FINAL_NAME" "work/output/videos/"
             fi
 
-            # 修复 Faststart
             echo "-> 修复 Faststart..."
             find work/output/videos -type f | while read -r f; do
               if ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$f" >/dev/null 2>&1; then
@@ -177,7 +284,6 @@
               fi
             done
 
-            # 生成缩略图
             echo "-> 生成缩略图..."
             find work/output/videos -type f | while read -r f; do
               rel="${f#work/output/videos/}"
@@ -188,27 +294,29 @@
               ffmpeg -y -v error -ss "$at" -i "$f" -frames:v 1 -vf "scale=-2:320" "$thumb_dir/$(basename "${rel%.*}").webp" 2>/dev/null || true
             done
 
-            # 上传
             echo "-> 上传至移动云盘..."
             UPLOAD_STATUS="✅ 上传成功"
-            if ! rclone copy "work/output/videos" "ol:$DEST" --transfers 1 --multi-thread-streams 2 --timeout 30m --retries 3 -P; then
+            
+            set +e
+            rclone copy "work/output/videos" "ol:$DEST" --transfers 1 --multi-thread-streams 2 --timeout 30m --retries 3 -P
+            RCLONE_EXIT=$?
+            set -e
+
+            if [ "$RCLONE_EXIT" -ne 0 ]; then
                UPLOAD_STATUS="❌ 上传失败"
                ERROR_COUNT=$((ERROR_COUNT + 1))
             fi
 
             if [ -d "work/output/thumbs" ]; then
-              rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q
+              rclone copy "work/output/thumbs" "ol:$DEST" --transfers 4 -q || true
             fi
 
-            # 写入单条文件摘要，同时加入可供复用的重命名列表
             echo "| $INDEX | [链接]($PURE_URL) | \`$FINAL_NAME\` | $HUMAN_SIZE | $UPLOAD_STATUS |" >> "$GITHUB_STEP_SUMMARY"
             
-            # 如果是普通文件（非压缩包），则追加到重命名复用列表中
             if [ "$IS_ARCHIVE" != "true" ]; then
               RENAME_LIST="${RENAME_LIST}${PURE_URL}|${FINAL_NAME}"$'\n'
             fi
 
-            # 清理
             rm -rf work/download/* work/output/videos/* work/output/thumbs/*
             INDEX=$((INDEX + 1))
           done < urls_list.txt
@@ -232,14 +340,12 @@
           
           FORMAT_TIME=$(printf '%02d:%02d:%02d' $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))
           
-          # 如果有报错，生成失败警告
           if [ "$ERROR_COUNT" -gt 0 ]; then
             ERROR_MSG="⚠️ 共有 $ERROR_COUNT 个文件处理失败，请检查上方日志。"
           else
             ERROR_MSG="✅ 所有文件处理完成，无报错。"
           fi
 
-          # 写入最终汇总统计
           {
             echo ""
             echo "### 📊 运行汇总"
@@ -257,7 +363,6 @@
             rclone size "ol:$DEST"
             echo "\`\`\`"
             
-            # 如果有可供复用的重命名列表，则将其附在最后
             if [ -n "$RENAME_LIST" ]; then
               echo ""
               echo "### 📋 可复用的下载链接与重命名列表"
@@ -267,3 +372,11 @@
               echo "\`\`\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump OpenList logs on failure
+        if: failure()
+        run: docker logs --tail 200 openlist || true
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f openlist || true
