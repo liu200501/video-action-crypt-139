@@ -101,12 +101,10 @@ jobs:
             sleep 2
           done
 
-      # ==================== 3.5 检查 rclone crypt remote 连通性（方案 A 新增）====================
-      - name: Check rclone crypt remote
+      # ==================== 3.5 准备 rclone 配置（仅用于统计，上传走 fs/put API）====================
+      - name: Prepare rclone config (stats only)
         env:
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
-          RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
-          RCLONE_CRYPT_PASSWORD2: ${{ secrets.RCLONE_CRYPT_PASSWORD2 }}
         run: |
           set -euo pipefail
           mkdir -p ~/.config/rclone
@@ -117,16 +115,9 @@ jobs:
           vendor = other
           user = admin
           pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
-
-          [ol-crypt]
-          type = crypt
-          remote = ol:${CRYPT_MOUNT}
-          filename_encoding = base64
-          password = $(rclone obscure "$RCLONE_CRYPT_PASSWORD")
-          password2 = $(rclone obscure "$RCLONE_CRYPT_PASSWORD2")
           EOF
-          rclone lsd ol-crypt: || { echo "::error::rclone crypt remote 无法列出，请检查 OpenList 目录与 crypt 密码"; exit 1; }
-          echo "rclone crypt remote OK"
+          rclone lsd "ol:${CRYPT_MOUNT}" || { echo "::error::rclone webdav remote 无法列出，请检查 OpenList 目录与管理密码"; exit 1; }
+          echo "rclone webdav remote OK"
 
       # ==================== 4. 核心：处理、上传与摘要 ====================
       - name: Process and Upload sequentially
@@ -137,8 +128,6 @@ jobs:
           REFERER: ${{ inputs.referer }}
           USER_AGENT: ${{ inputs.user_agent }}
           OPENLIST_ADMIN_PASS: ${{ secrets.OPENLIST_ADMIN_PASSWORD }}
-          RCLONE_CRYPT_PASSWORD: ${{ secrets.RCLONE_CRYPT_PASSWORD }}
-          RCLONE_CRYPT_PASSWORD2: ${{ secrets.RCLONE_CRYPT_PASSWORD2 }}
           TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
@@ -146,10 +135,65 @@ jobs:
           # ================= 动态摘要初始化 =================
           CLEAN_TAGS=$(echo "$TAGS" | tr ', ' '__' | sed 's#[/\\:*?"<>|]##g')
           [ -z "$CLEAN_TAGS" ] && CLEAN_TAGS="upload"
-          # 展示用（OpenList 视角的路径）
+          # 目标目录（OpenList 视角的绝对路径）
           DEST="${CRYPT_MOUNT}/${CLEAN_TAGS}"
-          # rclone crypt 视角的目标（相对 ol-crypt remote 根）
-          CRYPT_DEST="${CLEAN_TAGS}"
+
+          # ================= 获取 OpenList API Token =================
+          echo "-> 获取 OpenList API Token..."
+          LOGIN_RESP=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg u admin --arg p "$OPENLIST_ADMIN_PASS" '{username: $u, password: $p}')")
+          OPENLIST_TOKEN=$(printf '%s' "$LOGIN_RESP" | jq -r '.data.token // empty')
+          if [ -z "$OPENLIST_TOKEN" ] || [ "$OPENLIST_TOKEN" = "null" ]; then
+            echo "::error::获取 OpenList API Token 失败，请检查 OPENLIST_ADMIN_PASSWORD"
+            exit 1
+          fi
+          echo "OpenList API Token 获取成功"
+
+          # ================= OpenList fs/put 上传函数 =================
+          # openlist_put <本地文件> <OpenList 绝对路径>
+          openlist_put() {
+            local src="$1"
+            local dst="$2"
+            local encoded
+            encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$dst")
+            local url="http://localhost:${OPENLIST_PORT}/api/fs/put"
+            local body http_code resp code
+            body=$(curl -sS -X PUT "$url" \
+              --upload-file "$src" \
+              --max-time 1800 --retry 2 --retry-delay 5 \
+              -H "Authorization: $OPENLIST_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              -H "File-Path: $encoded" \
+              -w '\n%{http_code}' 2>&1) || true
+            http_code=$(printf '%s' "$body" | tail -n1)
+            resp=$(printf '%s' "$body" | sed '$d')
+            if [ "$http_code" != "200" ]; then
+              echo "::error::上传失败 HTTP $http_code: $dst"
+              echo "响应: $resp"
+              return 1
+            fi
+            code=$(printf '%s' "$resp" | jq -r '.code // empty' 2>/dev/null || true)
+            if [ "$code" != "200" ]; then
+              echo "::error::上传失败 code=${code:-未知}: $dst"
+              echo "响应: $resp"
+              return 1
+            fi
+            return 0
+          }
+
+          # openlist_put_dir <本地目录> <OpenList 绝对目标目录>（递归）
+          openlist_put_dir() {
+            local src_dir="$1"
+            local dst_dir="$2"
+            local fail=0
+            while IFS= read -r -d '' f; do
+              local rel="${f#"$src_dir"/}"
+              echo "  PUT -> $dst_dir/$rel"
+              openlist_put "$f" "$dst_dir/$rel" || fail=$((fail + 1))
+            done < <(find "$src_dir" -type f -print0)
+            return "$fail"
+          }
 
           # 记录开始时间
           START_TS=$(date +%s)
@@ -164,7 +208,7 @@ jobs:
             echo "| 全局参数 | 值 |"
             echo "| :--- | :--- |"
             echo "| **目标目录** | \`$DEST\` |"
-            echo "| **rclone 目标** | \`ol-crypt:$CRYPT_DEST\` |"
+            echo "| **上传方式** | \`OpenList /api/fs/put\` |"
             echo "| **是否为压缩包** | \`$IS_ARCHIVE\` |"
             echo "| **强制扩展名** | \`${EXT:-自动推断}\` |"
             echo "| **开始时间** | $START_TIME |"
@@ -173,24 +217,6 @@ jobs:
             echo "| # | 原始链接 | 最终文件名 | 大小 | 状态 |"
             echo "| :--- | :--- | :--- | :--- | :--- |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-          # 初始化 rclone 配置（含 crypt remote）
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [ol]
-          type = webdav
-          url = http://localhost:${OPENLIST_PORT}/dav
-          vendor = other
-          user = admin
-          pass = $(rclone obscure "$OPENLIST_ADMIN_PASS")
-
-          [ol-crypt]
-          type = crypt
-          remote = ol:${CRYPT_MOUNT}
-          filename_encoding = base64
-          password = $(rclone obscure "$RCLONE_CRYPT_PASSWORD")
-          password2 = $(rclone obscure "$RCLONE_CRYPT_PASSWORD2")
-          EOF
 
           # 智能切分链接
           printf '%s' "$URLS" > raw_input.txt
@@ -321,20 +347,17 @@ jobs:
               fi
             done
 
-            # ================= 上传（方案 A：走 ol-crypt）=================
-            echo "-> 上传至 OpenList（rclone crypt 加密）..."
+            # ================= 上传（调用 OpenList /api/fs/put）=================
+            echo "-> 上传至 OpenList（fs/put API）..."
             UPLOAD_STATUS="✅ 上传成功"
 
             set +e
-            rclone copy "work/output/videos" "ol-crypt:$CRYPT_DEST" \
-              --transfers 1 --multi-thread-streams 2 \
-              --timeout 5m --retries 2 \
-              --ignore-checksum --log-level DEBUG -P
-            RCLONE_EXIT=$?
+            openlist_put_dir "work/output/videos" "$DEST"
+            PUT_FAIL=$?
             set -e
 
-            if [ "$RCLONE_EXIT" -ne 0 ]; then
-               UPLOAD_STATUS="❌ 上传失败 (exit $RCLONE_EXIT)"
+            if [ "$PUT_FAIL" -ne 0 ]; then
+               UPLOAD_STATUS="❌ 上传失败 ($PUT_FAIL 个文件失败)"
                ERROR_COUNT=$((ERROR_COUNT + 1))
             fi
 
@@ -470,10 +493,19 @@ jobs:
           # 执行 Python 脚本批量生成缩略图
           python3 gen_thumb.py "work/output/videos"
 
-          # 将生成的缩略图统一步骤上传（方案 A：走 ol-crypt）
+          # 将生成的缩略图逐个上传（OpenList /api/fs/put）
           echo "-> 上传缩略图至云端..."
           if [ -d "work/output/videos" ]; then
-             rclone copy "work/output/videos" "ol-crypt:$CRYPT_DEST" --include ".thumbnails/**" --transfers 4 -q || true
+            THUMB_FAIL=0
+            while IFS= read -r -d '' t; do
+              rel="${t#work/output/videos/}"
+              openlist_put "$t" "$DEST/$rel" || THUMB_FAIL=$((THUMB_FAIL + 1))
+            done < <(find "work/output/videos" -type f -path '*/.thumbnails/*' -print0)
+            if [ "$THUMB_FAIL" -ne 0 ]; then
+              echo "::warning::有 $THUMB_FAIL 个缩略图上传失败"
+            else
+              echo "缩略图上传完成"
+            fi
           fi
 
           # 清理临时生成脚本
@@ -516,9 +548,9 @@ jobs:
             echo "| **等效速度** | $SPEED_STR |"
             echo "| **运行状态** | $ERROR_MSG |"
             echo ""
-            echo "> 远端存储统计（rclone crypt 视角）："
+            echo "> 远端存储统计（rclone size，仅用于统计）："
             echo "\`\`\`"
-            rclone size "ol-crypt:$CRYPT_DEST" || true
+            rclone size "ol:$DEST" || true
             echo "\`\`\`"
 
             if [ -n "$RENAME_LIST" ]; then
