@@ -214,6 +214,13 @@ jobs:
             local src_dir="$1"
             local dst_dir="$2"
             local fail=0
+            local mkdir_encoded mkdir_resp
+            mkdir_encoded=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$dst_dir")
+            mkdir_resp=$(curl -sS -X POST "http://localhost:${OPENLIST_PORT}/api/fs/mkdir" \
+              -H "Authorization: $OPENLIST_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg p "$mkdir_encoded" '{path: $p}')" 2>&1) || true
+            echo "mkdir $dst_dir -> $mkdir_resp"
             while IFS= read -r -d '' f; do
               local rel="${f#"$src_dir"/}"
               echo "  PUT -> $dst_dir/$rel"
